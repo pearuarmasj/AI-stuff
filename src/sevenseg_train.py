@@ -197,7 +197,7 @@ def main():
     model = TinyCNN().to(device)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-    for epoch in range(1, 6):
+    for epoch in range(1, 16):
         model.train()
         total_loss = 0.0
         for x, y in train_loader:
