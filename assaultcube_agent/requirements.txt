@@ -1,0 +1,30 @@
+# Core dependencies
+numpy
+opencv-python
+mss
+pillow
+
+# Input control (DirectInput for games)
+pydirectinput
+
+# Deep learning - PyTorch with CUDA
+torch
+torchvision
+
+# Depth estimation
+transformers
+
+# OCR for HUD reading (choose one)
+easyocr
+# pytesseract  # Alternative, requires Tesseract installation
+
+# Reinforcement learning
+gymnasium
+stable-baselines3[extra]
+
+# Logging and visualization
+tensorboard
+tqdm
+
+# Optional: YOLO for object detection
+# ultralytics
