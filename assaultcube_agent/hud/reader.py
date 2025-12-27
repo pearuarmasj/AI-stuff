@@ -97,12 +97,19 @@ class HUDReader:
                 else:
                     self._set_default_health_region()
 
-                if "ammo" in regions:
-                    r = regions["ammo"]
-                    self.ammo_region = (r["x"], r["y"], r["width"], r["height"])
-                    print(f"Loaded ammo region: {self.ammo_region}")
+                if "ammo_mag" in regions:
+                    r = regions["ammo_mag"]
+                    self.ammo_mag_region = (r["x"], r["y"], r["width"], r["height"])
+                    print(f"Loaded ammo_mag region: {self.ammo_mag_region}")
                 else:
-                    self._set_default_ammo_region()
+                    self.ammo_mag_region = None
+
+                if "ammo_reserve" in regions:
+                    r = regions["ammo_reserve"]
+                    self.ammo_reserve_region = (r["x"], r["y"], r["width"], r["height"])
+                    print(f"Loaded ammo_reserve region: {self.ammo_reserve_region}")
+                else:
+                    self.ammo_reserve_region = None
 
                 # Armor is optional (user said to ignore for now)
                 if "armor" in regions:
@@ -120,7 +127,8 @@ class HUDReader:
         # No config found - use defaults (probably wrong, run calibration!)
         print("WARNING: No HUD calibration found! Run calibrate.py first.")
         self._set_default_health_region()
-        self._set_default_ammo_region()
+        self.ammo_mag_region = None
+        self.ammo_reserve_region = None
         self.armor_region = None
 
     def _set_default_health_region(self):
@@ -134,44 +142,35 @@ class HUDReader:
             int(h * 0.12),
         )
 
-    def _set_default_ammo_region(self):
-        """Set default ammo region (probably wrong)."""
-        h = self.screen_height
-        w = self.screen_width
-        self.ammo_region = (
-            int(w * 0.85),
-            int(h * 0.85),
-            int(w * 0.12),
-            int(h * 0.12),
-        )
-
     def _extract_region(self, frame: np.ndarray, region: tuple) -> np.ndarray:
         """Extract a region from the frame."""
         x, y, w, h = region
         return frame[y:y+h, x:x+w].copy()
 
     def _preprocess_for_ocr(self, region: np.ndarray) -> np.ndarray:
-        """Preprocess region for better OCR accuracy."""
+        """Preprocess region for AC's stylized HUD font (white with black outline)."""
         # Convert to grayscale
         if len(region.shape) == 3:
             gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
         else:
-            gray = region
+            gray = region.copy()
 
-        # Increase contrast
-        gray = cv2.convertScaleAbs(gray, alpha=1.5, beta=0)
+        # The AC HUD has white text with black outlines
+        # Use adaptive threshold or high threshold to get just the white parts
+        _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
 
-        # Threshold to get white text on black background
-        _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+        # Dilate slightly to fill in the stylized font gaps
+        kernel = np.ones((2, 2), np.uint8)
+        thresh = cv2.dilate(thresh, kernel, iterations=1)
 
-        # Resize for better OCR (upscale)
-        scale = 2
+        # Upscale for better OCR
+        scale = 3
         thresh = cv2.resize(thresh, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
         return thresh
 
     def _ocr_number(self, region: np.ndarray) -> int:
-        """Extract a number from an image region using OCR."""
+        """Extract a single number from an image region using OCR."""
         if self.ocr is None:
             return 0
 
@@ -179,8 +178,14 @@ class HUDReader:
 
         try:
             if self.use_easyocr:
-                results = self.ocr.readtext(processed, detail=0)
-                text = ''.join(results)
+                # Get detailed results with bounding boxes
+                results = self.ocr.readtext(processed, detail=1, allowlist='0123456789')
+                if results:
+                    # Take the text with highest confidence
+                    best = max(results, key=lambda x: x[2])
+                    text = best[1]
+                else:
+                    text = ''
             else:
                 text = self.ocr.image_to_string(
                     processed,
@@ -191,7 +196,7 @@ class HUDReader:
             digits = ''.join(c for c in text if c.isdigit())
             return int(digits) if digits else 0
 
-        except Exception as e:
+        except Exception:
             return 0
 
     def read(self, frame: np.ndarray) -> HUDState:
@@ -217,9 +222,13 @@ class HUDReader:
             state.armor = self._ocr_number(armor_img)
             state.armor = max(0, min(100, state.armor))
 
-        if self.ammo_region:
-            ammo_img = self._extract_region(frame, self.ammo_region)
-            state.ammo_mag = self._ocr_number(ammo_img)
+        if self.ammo_mag_region:
+            ammo_mag_img = self._extract_region(frame, self.ammo_mag_region)
+            state.ammo_mag = self._ocr_number(ammo_mag_img)
+
+        if self.ammo_reserve_region:
+            ammo_reserve_img = self._extract_region(frame, self.ammo_reserve_region)
+            state.ammo_reserve = self._ocr_number(ammo_reserve_img)
 
         return state
 
@@ -260,11 +269,17 @@ class HUDReader:
             cv2.rectangle(vis, (x, y), (x+w, y+h), (255, 0, 0), 2)
             cv2.putText(vis, "ARMOR", (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
 
-        # Draw ammo region (orange)
-        if self.ammo_region:
-            x, y, w, h = self.ammo_region
+        # Draw ammo mag region (orange)
+        if self.ammo_mag_region:
+            x, y, w, h = self.ammo_mag_region
             cv2.rectangle(vis, (x, y), (x+w, y+h), (0, 165, 255), 2)
-            cv2.putText(vis, "AMMO", (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+            cv2.putText(vis, "AMMO_MAG", (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+
+        # Draw ammo reserve region (cyan)
+        if self.ammo_reserve_region:
+            x, y, w, h = self.ammo_reserve_region
+            cv2.rectangle(vis, (x, y), (x+w, y+h), (255, 255, 0), 2)
+            cv2.putText(vis, "AMMO_RES", (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
 
         return vis
 

@@ -27,7 +27,7 @@ class HUDCalibrator:
         self.drawing = False
 
         # Regions to calibrate (in order)
-        self.regions_to_calibrate = ["health", "ammo"]
+        self.regions_to_calibrate = ["health", "ammo_mag", "ammo_reserve"]
         self.current_index = 0
 
         self.frame = None
@@ -114,7 +114,7 @@ class HUDCalibrator:
             print(f"  Saved {region_name} region: x={orig_x}, y={orig_y}, w={orig_w}, h={orig_h}")
 
             # Color the saved rectangle
-            colors = {"health": "green", "ammo": "orange"}
+            colors = {"health": "green", "ammo_mag": "orange", "ammo_reserve": "cyan"}
             color = colors.get(region_name, "white")
             self.canvas.itemconfig(self.rect_id, outline=color)
 
@@ -141,11 +141,11 @@ class HUDCalibrator:
             self.root.destroy()
 
         elif event.keysym == 'Return':
-            if len(self.regions) >= 2:
+            if len(self.regions) >= 3:
                 self.save_config()
                 self.root.destroy()
             else:
-                print("Please define all regions before saving.")
+                print("Please define all regions before saving (health, ammo_mag, ammo_reserve).")
 
         elif event.keysym.lower() == 'r':
             print("Refreshing screenshot...")
@@ -165,7 +165,7 @@ class HUDCalibrator:
 
     def redraw_regions(self):
         """Redraw all saved regions."""
-        colors = {"health": "green", "ammo": "orange"}
+        colors = {"health": "green", "ammo_mag": "orange", "ammo_reserve": "cyan"}
         scale_x = self.display_width / self.monitor["width"]
         scale_y = self.display_height / self.monitor["height"]
 

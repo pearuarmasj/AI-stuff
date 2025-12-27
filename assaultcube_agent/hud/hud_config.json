@@ -3,16 +3,22 @@
   "screen_height": 1440,
   "regions": {
     "health": {
-      "x": 15,
-      "y": 1282,
-      "width": 291,
-      "height": 85
+      "x": 125,
+      "y": 1281,
+      "width": 181,
+      "height": 87
     },
-    "ammo": {
-      "x": 730,
-      "y": 1279,
-      "width": 292,
-      "height": 85
+    "ammo_mag": {
+      "x": 837,
+      "y": 1282,
+      "width": 122,
+      "height": 87
+    },
+    "ammo_reserve": {
+      "x": 962,
+      "y": 1282,
+      "width": 60,
+      "height": 42
     }
   }
 }
