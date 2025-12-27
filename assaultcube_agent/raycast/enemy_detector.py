@@ -1,10 +1,9 @@
 """
-Enemy detection via memory reading (Phase 1).
+Enemy detection via memory reading with line-of-sight checking.
 
 Reads the players array from AC memory and calculates
 direction/distance to each enemy relative to own player's view.
-
-No wall occlusion yet - that's Phase 2.
+Uses map geometry to check line-of-sight (wall occlusion).
 """
 
 import math
@@ -13,6 +12,8 @@ from typing import Optional
 
 import pymem
 import pymem.process
+
+from .los_check import LOSChecker
 
 
 @dataclass
@@ -28,6 +29,7 @@ class EnemyInfo:
     pos_z: float = 0.0
     health: int = 0         # Enemy health
     is_alive: bool = True
+    has_los: bool = True    # Line-of-sight clear (not behind wall)
 
 
 class EnemyDetector:
@@ -58,13 +60,15 @@ class EnemyDetector:
         "team": 0x30C,  # 0=CLA, 1=RVSF
     }
 
-    def __init__(self, fov_h: float = 90.0, fov_v: float = 60.0):
+    def __init__(self, fov_h: float = 90.0, fov_v: float = 60.0, use_los: bool = True):
         self.pm: Optional[pymem.Pymem] = None
         self.module_base: int = 0
         self._attached = False
         self.fov_h = fov_h
         self.fov_v = fov_v
         self._player1_ptr: int = 0
+        self._use_los = use_los
+        self._los_checker: Optional[LOSChecker] = None
 
     def attach(self) -> bool:
         """Attach to AssaultCube process."""
@@ -77,6 +81,18 @@ class EnemyDetector:
             self._attached = True
             print(f"[EnemyDetector] Attached to {self.PROCESS_NAME}")
             print(f"[EnemyDetector] Module base: 0x{self.module_base:X}")
+
+            # Initialize LOS checker if enabled
+            if self._use_los:
+                self._los_checker = LOSChecker()
+                # Share the pymem instance
+                self._los_checker.pm = self.pm
+                self._los_checker.module_base = self.module_base
+                self._los_checker._attached = True
+                # Read world data
+                self._los_checker._refresh_world()
+                print(f"[EnemyDetector] LOS checking enabled (world=0x{self._los_checker._world_ptr:X}, ssize={self._los_checker._ssize})")
+
             return True
 
         except pymem.exception.ProcessNotFound:
@@ -207,6 +223,21 @@ class EnemyDetector:
 
         return (distance, angle_h, angle_v)
 
+    def _check_los(
+        self,
+        from_pos: tuple[float, float, float],
+        to_pos: tuple[float, float, float]
+    ) -> bool:
+        """Check line-of-sight between two positions."""
+        if not self._los_checker or not self._los_checker._attached:
+            return True  # If LOS checker not available, assume clear
+
+        return self._los_checker.check_los(
+            from_pos[0], from_pos[1], from_pos[2],
+            to_pos[0], to_pos[1], to_pos[2],
+            margin=1.0
+        )
+
     def detect_enemies(
         self,
         own_pos: tuple[float, float, float],
@@ -214,6 +245,7 @@ class EnemyDetector:
         own_pitch: float,
         max_distance: float = 500.0,
         filter_team: bool = True,
+        filter_los: bool = True,
         debug: bool = False
     ) -> list[EnemyInfo]:
         """
@@ -221,6 +253,7 @@ class EnemyDetector:
 
         Args:
             filter_team: If True, only return enemies (different team). If False, return all players.
+            filter_los: If True, only return enemies with clear line-of-sight.
             debug: If True, print debug info for each player.
 
         Returns:
@@ -236,6 +269,10 @@ class EnemyDetector:
             return []
 
         own_team = self._get_own_team() if filter_team else -1
+
+        # Refresh world data in case map changed
+        if self._los_checker:
+            self._los_checker._refresh_world()
 
         for i in range(count):
             try:
@@ -273,11 +310,20 @@ class EnemyDetector:
                         print(f"  [Player {i}] SKIP: too far (dist={distance:.0f} > max={max_distance})")
                     continue
 
+                # Check line-of-sight
+                has_los = self._check_los(own_pos, pos)
+
+                if filter_los and not has_los:
+                    if debug:
+                        print(f"  [Player {i}] SKIP: no LOS (behind wall)")
+                    continue
+
                 in_fov = abs(angle_h) <= self.fov_h / 2 and abs(angle_v) <= self.fov_v / 2
 
                 if debug:
                     player_team = self._read_player_team(player_ptr)
-                    print(f"  [Player {i}] FOUND: team={player_team}, hp={health}, dist={distance:.0f}, pos=({pos[0]:.0f},{pos[1]:.0f},{pos[2]:.0f})")
+                    los_str = "LOS" if has_los else "BLOCKED"
+                    print(f"  [Player {i}] FOUND: team={player_team}, hp={health}, dist={distance:.0f}, {los_str}, pos=({pos[0]:.0f},{pos[1]:.0f},{pos[2]:.0f})")
 
                 enemies.append(EnemyInfo(
                     index=i,
@@ -290,6 +336,7 @@ class EnemyDetector:
                     pos_z=pos[2],
                     health=health,
                     is_alive=True,
+                    has_los=has_los,
                 ))
 
             except:
@@ -302,11 +349,15 @@ class EnemyDetector:
         own_pos: tuple[float, float, float],
         own_yaw: float,
         own_pitch: float,
-        max_distance: float = 500.0
+        max_distance: float = 500.0,
+        require_los: bool = True
     ) -> Optional[EnemyInfo]:
-        """Get the closest enemy in FOV."""
-        enemies = self.detect_enemies(own_pos, own_yaw, own_pitch, max_distance)
-        in_fov = [e for e in enemies if e.in_fov]
+        """Get the closest enemy in FOV with line-of-sight."""
+        enemies = self.detect_enemies(
+            own_pos, own_yaw, own_pitch, max_distance,
+            filter_los=require_los
+        )
+        in_fov = [e for e in enemies if e.in_fov and (not require_los or e.has_los)]
         if not in_fov:
             return None
         return min(in_fov, key=lambda e: e.distance)

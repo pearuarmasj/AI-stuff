@@ -85,10 +85,10 @@ class AssaultCubeEnv(gym.Env):
             raise RuntimeError("Failed to attach to AssaultCube process!")
         print("[+] Memory reader ready")
 
-        self.enemy_detector = EnemyDetector(fov_h=fov_h, fov_v=fov_v)
+        self.enemy_detector = EnemyDetector(fov_h=fov_h, fov_v=fov_v, use_los=True)
         if not self.enemy_detector.attach():
             raise RuntimeError("Failed to attach enemy detector!")
-        print("[+] Enemy detector ready")
+        print("[+] Enemy detector ready (with LOS checking)")
 
         self.action_mapper = ActionMapper()
         print("[+] Action mapper ready")
@@ -109,11 +109,11 @@ class AssaultCubeEnv(gym.Env):
                 shape=(3,),
                 dtype=np.float32,
             ),
-            # Enemy slots: [in_fov, distance_norm, angle_h_norm, angle_v_norm] x MAX_ENEMIES
+            # Enemy slots: [in_fov, has_los, distance_norm, angle_h_norm, angle_v_norm] x MAX_ENEMIES
             'enemies': spaces.Box(
                 low=-1,
                 high=1,
-                shape=(MAX_ENEMIES, 4),
+                shape=(MAX_ENEMIES, 5),
                 dtype=np.float32,
             ),
         })
@@ -169,22 +169,24 @@ class AssaultCubeEnv(gym.Env):
             min(game_state.ammo_mag, 100) / 100.0,
         ], dtype=np.float32)
 
-        # Detect enemies
+        # Detect enemies (with LOS filtering - only returns visible enemies)
         own_pos = (game_state.pos_x, game_state.pos_y, game_state.pos_z)
         enemies = self.enemy_detector.detect_enemies(
             own_pos, game_state.yaw, game_state.pitch,
             max_distance=500.0,
-            filter_team=True
+            filter_team=True,
+            filter_los=True,  # Only return enemies with clear line-of-sight
         )
         self._last_enemies = enemies
 
         # Build enemy observation array
-        enemy_obs = np.zeros((MAX_ENEMIES, 4), dtype=np.float32)
+        enemy_obs = np.zeros((MAX_ENEMIES, 5), dtype=np.float32)
         for i, e in enumerate(enemies[:MAX_ENEMIES]):
             enemy_obs[i, 0] = 1.0 if e.in_fov else 0.0
-            enemy_obs[i, 1] = min(e.distance / 500.0, 1.0)  # Normalize distance
-            enemy_obs[i, 2] = e.angle_h / 180.0  # Normalize angle
-            enemy_obs[i, 3] = e.angle_v / 90.0
+            enemy_obs[i, 1] = 1.0 if e.has_los else 0.0  # Line-of-sight flag
+            enemy_obs[i, 2] = min(e.distance / 500.0, 1.0)  # Normalize distance
+            enemy_obs[i, 3] = e.angle_h / 180.0  # Normalize angle
+            enemy_obs[i, 4] = e.angle_v / 90.0
 
         return {
             'depth': depth_obs,
@@ -216,10 +218,10 @@ class AssaultCubeEnv(gym.Env):
             reward -= 50.0
             self._deaths += 1
 
-        # Reward for aiming at enemies (enemy in FOV)
+        # Reward for aiming at visible enemies (in FOV with line-of-sight)
         for e in self._last_enemies:
-            if e.in_fov:
-                # Small reward for having enemy in view
+            if e.in_fov and e.has_los:
+                # Small reward for having visible enemy in view
                 reward += 0.1
                 # Bonus for being close to center of view
                 aim_accuracy = 1.0 - (abs(e.angle_h) / 45.0)

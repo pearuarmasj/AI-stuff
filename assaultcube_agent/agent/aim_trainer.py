@@ -62,6 +62,11 @@ class AimTrainer:
         self.targets_found = 0
         self.shots_fired = 0
 
+        # Shooting state
+        self._is_shooting = False
+        self._last_shot_time = 0
+        self._shot_cooldown = 0.1  # Min time between shots (100ms)
+
         # Attach to game
         if not self.memory.attach():
             raise RuntimeError("Failed to attach to AssaultCube! Make sure it's running.")
@@ -114,6 +119,10 @@ class AimTrainer:
             print(f"  => enemies_found={len(enemies)}")
 
         if not enemies:
+            # No enemies - stop shooting if we were
+            if self._is_shooting:
+                self.mouse.release('left')
+                self._is_shooting = False
             return False
 
         # Find closest enemy in FOV (or closest overall if none in FOV)
@@ -140,10 +149,24 @@ class AimTrainer:
         # Only move if there's meaningful offset
         if abs(dx_pixels) > 1 or abs(dy_pixels) > 1:
             self.mouse.move(dx_pixels, dy_pixels)
+            # Not on target - stop shooting
+            if self._is_shooting:
+                self.mouse.release('left')
+                self._is_shooting = False
         elif self.shoot and target.in_fov and abs(target.angle_h) < 5:
-            # On target (within 5 degrees), shoot
-            self.mouse.click()
-            self.shots_fired += 1
+            # On target (within 5 degrees), shoot with cooldown
+            current_time = time.perf_counter()
+            if current_time - self._last_shot_time >= self._shot_cooldown:
+                if not self._is_shooting:
+                    self.mouse.press('left')
+                    self._is_shooting = True
+                self._last_shot_time = current_time
+                self.shots_fired += 1
+        else:
+            # Not shooting - release if we were
+            if self._is_shooting:
+                self.mouse.release('left')
+                self._is_shooting = False
 
         return True
 
@@ -186,12 +209,19 @@ class AimTrainer:
 
         finally:
             self.running = False
+            # IMPORTANT: Release mouse button if shooting
+            if self._is_shooting:
+                self.mouse.release('left')
+                self._is_shooting = False
             emergency_stop.stop_listener()
             self._print_stats()
 
     def stop(self):
-        """Stop the main loop."""
+        """Stop the main loop and release inputs."""
         self.running = False
+        if self._is_shooting:
+            self.mouse.release('left')
+            self._is_shooting = False
 
     def _print_stats(self):
         """Print session statistics."""

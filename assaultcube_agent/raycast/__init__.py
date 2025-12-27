@@ -1,10 +1,12 @@
 """
-Raycast module for enemy awareness.
+Raycast module for enemy awareness with line-of-sight checking.
 
-Phase 1: Read player positions, calculate direction/distance
-Phase 2: Full map raycasting for wall occlusion (later)
+Features:
+- Read player positions, calculate direction/distance
+- Map raycasting for wall occlusion (LOS checking)
 """
 
 from .enemy_detector import EnemyDetector, EnemyInfo
+from .los_check import LOSChecker
 
-__all__ = ["EnemyDetector", "EnemyInfo"]
+__all__ = ["EnemyDetector", "EnemyInfo", "LOSChecker"]
