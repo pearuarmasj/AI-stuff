@@ -13,7 +13,7 @@ import pymem
 import pymem.process
 
 from .structs import GameState, NUMGUNS
-from .offsets import PLAYER1_PTR_OFFSET, OFFSETS
+from .offsets import PLAYER1_PTR_OFFSET, OFFSETS, PSTAT_DAMAGE_BASE
 
 
 class ACMemoryReader:
@@ -154,6 +154,14 @@ class ACMemoryReader:
         # Read frags/deaths
         state.frags = self._read_int(self.OFFSETS["frags"])
         state.deaths = self._read_int(self.OFFSETS["deaths"])
+
+        # Read total damage dealt (sum of pstatdamage[NUMGUNS])
+        total_damage = 0
+        for i in range(NUMGUNS):
+            dmg = self._read_int(PSTAT_DAMAGE_BASE + i * 4)
+            if dmg > 0:
+                total_damage += dmg
+        state.damage_dealt = total_damage
 
         return state
 

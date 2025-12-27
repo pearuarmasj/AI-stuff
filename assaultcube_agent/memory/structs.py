@@ -53,6 +53,7 @@ class GameState:
     ammo_reserve: int = 0  # Reserve ammo
     frags: int = 0         # Kill count
     deaths: int = 0        # Death count
+    damage_dealt: int = 0  # Total damage dealt (sum of pstatdamage[NUMGUNS])
 
     @property
     def position(self) -> tuple:

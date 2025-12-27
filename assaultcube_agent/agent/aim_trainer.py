@@ -1,13 +1,8 @@
 """
-Aim Trainer Agent
+Aim Trainer Agent - Using EnemyDetector with LiDAR visualization.
 
-Simple agent that:
-1. Reads player state from memory
-2. Detects enemies via memory reading
-3. Snaps crosshair to nearest enemy in FOV
-4. (Optional) Shoots
-
-No movement, no game sense, just aiming practice.
+Uses memory-based enemy detection (EnemyDetector) for accurate angle calculation,
+with optional LiDAR visualization for spatial awareness.
 
 CONTROLS:
     F10 = STOP
@@ -15,18 +10,22 @@ CONTROLS:
 """
 
 import time
+from typing import Optional
 
 from ..memory import ACMemoryReader
-from ..raycast import EnemyDetector
+from ..raycast import OmniRaycastObserver
+from ..raycast.enemy_detector import EnemyDetector, EnemyInfo
 from ..control import MouseController, emergency_stop, check_stop, wait_if_paused
+from ..visualize import LidarVisualizer
 
 
 class AimTrainer:
     """
-    Basic aim training agent using memory-based enemy detection.
+    Aim training agent using memory-based enemy detection.
 
-    Continuously reads game state, detects enemies, and snaps
-    the crosshair toward the closest visible enemy.
+    Uses EnemyDetector for accurate angle calculation (reads actual enemy positions
+    and computes proper view-relative angles). Optional LiDAR visualization shows
+    spatial awareness data.
     """
 
     def __init__(
@@ -34,9 +33,11 @@ class AimTrainer:
         sensitivity: float = 1.0,
         aim_speed: float = 0.3,
         shoot: bool = False,
-        fov_h: float = 90.0,
-        fov_v: float = 60.0,
-        max_distance: float = 300.0,
+        game_fov: float = 120.0,
+        max_distance: float = 250.0,
+        horizontal_rays: int = 72,
+        vertical_layers: int = 9,
+        visualize: bool = False,
     ):
         """
         Args:
@@ -44,16 +45,42 @@ class AimTrainer:
             aim_speed: 0-1, how much of the angle offset to correct per frame
                        1.0 = instant snap, 0.1 = slow tracking
             shoot: Whether to auto-fire when on target
-            fov_h: Horizontal field of view in degrees
-            fov_v: Vertical field of view in degrees
-            max_distance: Max distance to track enemies
+            game_fov: Game's field of view in degrees (for FOV filtering)
+            max_distance: Max detection distance
+            horizontal_rays: Horizontal rays for LiDAR visualization
+            vertical_layers: Vertical layers for LiDAR visualization
+            visualize: Whether to show real-time LiDAR visualization window
         """
+        # Memory reader for player state
         self.memory = ACMemoryReader()
-        self.detector = EnemyDetector(fov_h=fov_h, fov_v=fov_v)
+
+        # Enemy detector - uses memory reading with proper angle calculation
+        self.detector = EnemyDetector(fov_h=game_fov, fov_v=90.0, use_los=True)
+
+        # Optional LiDAR for visualization only (NOT for enemy detection!)
+        self._visualize = visualize
+        self._visualizer: Optional[LidarVisualizer] = None
+        self._raycast: Optional[OmniRaycastObserver] = None
+
+        if visualize:
+            self._raycast = OmniRaycastObserver(
+                horizontal_rays=horizontal_rays,
+                vertical_layers=vertical_layers,
+                max_distance=max_distance,
+            )
+            self._visualizer = LidarVisualizer(
+                h_rays=horizontal_rays,
+                v_layers=vertical_layers,
+                fov_degrees=game_fov,
+                max_dist=max_distance,
+            )
+
         self.mouse = MouseController(sensitivity=sensitivity)
 
         self.aim_speed = aim_speed
         self.shoot = shoot
+        self.game_fov = game_fov
+        self.half_fov = game_fov / 2.0
         self.max_distance = max_distance
         self.running = False
 
@@ -65,15 +92,33 @@ class AimTrainer:
         # Shooting state
         self._is_shooting = False
         self._last_shot_time = 0
-        self._shot_cooldown = 0.1  # Min time between shots (100ms)
+        self._shot_cooldown = 0.1
 
         # Attach to game
         if not self.memory.attach():
             raise RuntimeError("Failed to attach to AssaultCube! Make sure it's running.")
         if not self.detector.attach():
             raise RuntimeError("Failed to attach enemy detector!")
+        if self._raycast and not self._raycast.attach():
+            raise RuntimeError("Failed to attach raycast observer!")
 
         print("[+] Aim trainer initialized")
+        print(f"    Detection: Memory-based (EnemyDetector with LOS)")
+        print(f"    Game FOV: {game_fov}° (±{self.half_fov}°)")
+        print(f"    Visualize: {visualize}")
+
+    def _select_target(self, enemies: list) -> Optional[EnemyInfo]:
+        """Select best target from detected enemies."""
+        if not enemies:
+            return None
+
+        # Only consider enemies in FOV with clear LOS
+        valid = [e for e in enemies if e.in_fov and e.has_los]
+        if not valid:
+            return None
+
+        # Pick closest enemy
+        return min(valid, key=lambda e: e.distance)
 
     def step(self) -> bool:
         """
@@ -92,69 +137,78 @@ class AimTrainer:
             self.running = False
             return False
 
-        # Read player state
-        state = self.memory.read_state()
-        own_pos = (state.pos_x, state.pos_y, state.pos_z)
-
         self.frames_processed += 1
         do_debug = self.frames_processed % 60 == 0
 
-        # Debug output every 60 frames
-        if do_debug:
-            array_ptr, player_count = self.detector._read_players_array()
-            own_team = self.detector._get_own_team()
-            print(f"[DEBUG] Frame {self.frames_processed}: players={player_count}, own_team={own_team}, pos=({state.pos_x:.0f},{state.pos_y:.0f},{state.pos_z:.0f})")
+        # Read player state
+        state = self.memory.read_state()
+        own_pos = state.position
+        own_yaw = state.yaw
+        own_pitch = state.pitch
 
-        # Detect enemies
+        # Detect enemies using EnemyDetector (proper angle calculation!)
         enemies = self.detector.detect_enemies(
-            own_pos,
-            state.yaw,
-            state.pitch,
+            own_pos, own_yaw, own_pitch,
             max_distance=self.max_distance,
             filter_team=True,
-            debug=do_debug,
+            filter_los=True,
         )
 
+        # Update LiDAR visualization if enabled
+        if self._visualizer and self._visualizer.is_running() and self._raycast:
+            rays = self._raycast.get_observation()
+            self._visualizer.update(rays, {
+                'health': state.health,
+                'frags': state.frags,
+                'damage': state.damage_dealt,
+            })
+
         if do_debug:
-            print(f"  => enemies_found={len(enemies)}")
+            enemy_count = len(enemies)
+            in_fov_count = len([e for e in enemies if e.in_fov])
+            print(f"[Frame {self.frames_processed}] HP:{state.health} Enemies:{enemy_count} (FOV:{in_fov_count})")
 
         if not enemies:
-            # No enemies - stop shooting if we were
+            # No enemies visible - stop shooting
             if self._is_shooting:
                 self.mouse.release('left')
                 self._is_shooting = False
             return False
 
-        # Find closest enemy in FOV (or closest overall if none in FOV)
-        in_fov = [e for e in enemies if e.in_fov]
-        if in_fov:
-            target = min(in_fov, key=lambda e: e.distance)
-        else:
-            target = min(enemies, key=lambda e: abs(e.angle_h))
+        # Select target
+        target = self._select_target(enemies)
+        if not target:
+            if self._is_shooting:
+                self.mouse.release('left')
+                self._is_shooting = False
+            return False
 
         self.targets_found += 1
 
         # Calculate mouse movement needed
-        # angle_h is degrees offset from center, positive = right
-        # angle_v is degrees offset from center, positive = up
+        # angle_h: positive = enemy is to the right, need to move mouse right
+        # angle_v: positive = enemy is above, need to move mouse up (which is negative dy)
         dx = target.angle_h * self.aim_speed
-        dy = -target.angle_v * self.aim_speed  # Invert for mouse (down = positive)
+        dy = -target.angle_v * self.aim_speed  # Invert for mouse
 
-        # Convert degrees to pixels (rough approximation)
-        # This depends on game sensitivity - may need tuning
-        pixels_per_degree = 15.0  # Adjust based on your in-game sensitivity
+        # Convert degrees to pixels (tune based on in-game sensitivity)
+        pixels_per_degree = 15.0
         dx_pixels = int(dx * pixels_per_degree)
         dy_pixels = int(dy * pixels_per_degree)
 
-        # Only move if there's meaningful offset
+        # Debug target info occasionally
+        if do_debug:
+            print(f"  Target: h={target.angle_h:.1f}° v={target.angle_v:.1f}° dist={target.distance:.1f} hp={target.health}")
+
+        # Apply aim correction
         if abs(dx_pixels) > 1 or abs(dy_pixels) > 1:
             self.mouse.move(dx_pixels, dy_pixels)
             # Not on target - stop shooting
             if self._is_shooting:
                 self.mouse.release('left')
                 self._is_shooting = False
-        elif self.shoot and target.in_fov and abs(target.angle_h) < 5:
-            # On target (within 5 degrees), shoot with cooldown
+        elif self.shoot and abs(target.angle_h) < 5 and abs(target.angle_v) < 10:
+            # On target (within 5° horizontal, 10° vertical), shoot
             current_time = time.perf_counter()
             if current_time - self._last_shot_time >= self._shot_cooldown:
                 if not self._is_shooting:
@@ -163,7 +217,6 @@ class AimTrainer:
                 self._last_shot_time = current_time
                 self.shots_fired += 1
         else:
-            # Not shooting - release if we were
             if self._is_shooting:
                 self.mouse.release('left')
                 self._is_shooting = False
@@ -173,19 +226,21 @@ class AimTrainer:
     def run(self, fps_limit: int = 60):
         """
         Main loop. Run until stopped.
-
-        Args:
-            fps_limit: Max frames per second
         """
         self.running = True
         frame_time = 1.0 / fps_limit
 
-        # Start emergency stop listener
         emergency_stop.start()
 
+        # Start visualization if enabled
+        if self._visualizer:
+            self._visualizer.start()
+
         print("=" * 50)
-        print("AIM TRAINER STARTED")
+        print("AIM TRAINER STARTED (EnemyDetector + LOS)")
         print(f"  aim_speed={self.aim_speed}, shoot={self.shoot}")
+        print(f"  max_distance={self.max_distance}, fov={self.game_fov}°")
+        print(f"  visualize={self._visualize}")
         print("  F10 = STOP | F9 = PAUSE/RESUME")
         print("=" * 50)
 
@@ -195,11 +250,14 @@ class AimTrainer:
 
                 self.step()
 
-                # Check if we should stop
                 if check_stop():
                     break
 
-                # Frame limiting
+                # Stop if visualization window was closed
+                if self._visualizer and not self._visualizer.is_running():
+                    print("[*] Visualization closed, stopping...")
+                    break
+
                 elapsed = time.perf_counter() - start
                 if elapsed < frame_time:
                     time.sleep(frame_time - elapsed)
@@ -209,19 +267,30 @@ class AimTrainer:
 
         finally:
             self.running = False
-            # IMPORTANT: Release mouse button if shooting
             if self._is_shooting:
                 self.mouse.release('left')
                 self._is_shooting = False
+            if self._visualizer:
+                self._visualizer.stop()
+            if self.detector:
+                self.detector.detach()
+            if self._raycast:
+                self._raycast.detach()
             emergency_stop.stop_listener()
             self._print_stats()
 
     def stop(self):
-        """Stop the main loop and release inputs."""
+        """Stop and release inputs."""
         self.running = False
         if self._is_shooting:
             self.mouse.release('left')
             self._is_shooting = False
+        if self._visualizer:
+            self._visualizer.stop()
+        if self.detector:
+            self.detector.detach()
+        if self._raycast:
+            self._raycast.detach()
 
     def _print_stats(self):
         """Print session statistics."""
@@ -238,7 +307,7 @@ def main():
     """Run aim trainer from command line."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="AssaultCube Aim Trainer")
+    parser = argparse.ArgumentParser(description="AssaultCube Aim Trainer (Memory-based with LOS)")
     parser.add_argument(
         "--sensitivity", "-s",
         type=float,
@@ -257,16 +326,27 @@ def main():
         help="Auto-fire when on target",
     )
     parser.add_argument(
+        "--fov",
+        type=float,
+        default=120.0,
+        help="Game's field of view in degrees (default: 120). Enemy detection is limited to this FOV.",
+    )
+    parser.add_argument(
         "--distance", "-d",
         type=float,
-        default=300.0,
-        help="Max tracking distance (default: 300)",
+        default=250.0,
+        help="Max enemy detection distance (default: 250)",
     )
     parser.add_argument(
         "--fps",
         type=int,
         default=60,
         help="FPS limit (default: 60)",
+    )
+    parser.add_argument(
+        "--visualize", "-v",
+        action="store_true",
+        help="Show real-time LiDAR visualization window",
     )
 
     args = parser.parse_args()
@@ -275,7 +355,9 @@ def main():
         sensitivity=args.sensitivity,
         aim_speed=args.aim_speed,
         shoot=args.shoot,
+        game_fov=args.fov,
         max_distance=args.distance,
+        visualize=args.visualize,
     )
     trainer.run(fps_limit=args.fps)
 

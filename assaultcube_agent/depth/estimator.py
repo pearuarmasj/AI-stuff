@@ -12,7 +12,7 @@ from PIL import Image
 
 class DepthEstimator:
     """
-    Depth estimation using Depth Anything V2.
+    Depth estimation using Depth Anything V2, or fast grayscale mode.
 
     Converts RGB frames to depth maps for spatial awareness.
     The agent uses this to understand distances to walls/enemies.
@@ -20,13 +20,13 @@ class DepthEstimator:
 
     def __init__(
         self,
-        model_size: str = "small",
+        model_size: str = "none",
         device: str | None = None,
         output_size: tuple[int, int] = (160, 120),
     ):
         """
         Args:
-            model_size: "small", "base", or "large" - tradeoff speed vs quality
+            model_size: "small", "base", "large", or "none" (grayscale, no model)
             device: "cuda", "cpu", or None for auto-detect
             output_size: (width, height) of output depth map
         """
@@ -34,6 +34,13 @@ class DepthEstimator:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
         self.output_size = output_size
+        self.model_size = model_size
+
+        # "none" = no depth model, just use grayscale (FAST)
+        if model_size == "none":
+            print("[DepthEstimator] Using grayscale mode (no depth model) - FAST")
+            self.pipe = None
+            return
 
         # Model selection - using transformers pipeline for simplicity
         model_ids = {
@@ -43,7 +50,7 @@ class DepthEstimator:
         }
 
         if model_size not in model_ids:
-            raise ValueError(f"model_size must be one of {list(model_ids.keys())}")
+            raise ValueError(f"model_size must be one of {list(model_ids.keys())} or 'none'")
 
         self.model_id = model_ids[model_size]
         self.pipe = None
@@ -73,8 +80,17 @@ class DepthEstimator:
 
         Returns:
             Depth map as float32 array (output_size[1], output_size[0])
-            Values normalized to 0-1 range (0 = close, 1 = far)
+            Values normalized to 0-1 range
         """
+        # FAST MODE: Just use grayscale (no depth model)
+        if self.pipe is None:
+            # Convert to grayscale and resize
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.resize(gray, self.output_size, interpolation=cv2.INTER_LINEAR)
+            # Normalize to 0-1
+            return gray.astype(np.float32) / 255.0
+
+        # SLOW MODE: Full depth model inference
         # Convert BGR to RGB
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 

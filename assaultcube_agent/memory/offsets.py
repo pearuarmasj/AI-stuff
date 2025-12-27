@@ -73,8 +73,12 @@ TEAM = 0x30C
 GUNSELECT = 0x0  # TODO: Find this offset
 
 # Ammo arrays (each NUMGUNS=9 ints)
-AMMO_BASE = 0x0   # TODO: Find this offset
-MAG_BASE = 0x0    # TODO: Find this offset
+AMMO_BASE = 0x104   # ammo[9] array
+MAG_BASE = 0x128    # mag[9] array
+
+# Damage stats (for reward tracking)
+# pstatshots[9] at 0x170, pstatdamage[9] at 0x194
+PSTAT_DAMAGE_BASE = 0x194  # int[9] - damage dealt per weapon
 
 
 # =============================================================================

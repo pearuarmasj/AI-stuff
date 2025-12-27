@@ -1,0 +1,31 @@
+{
+  "screen_width": 1920,
+  "screen_height": 1080,
+  "obs_width": 160,
+  "obs_height": 120,
+  "depth_model_size": "none",
+  "frame_skip": 4,
+  "algorithm": "PPO",
+  "total_timesteps": 100000,
+  "learning_rate": 0.0003,
+  "batch_size": 64,
+  "n_steps": 2048,
+  "gamma": 0.99,
+  "gae_lambda": 0.95,
+  "clip_range": 0.2,
+  "ent_coef": 0.01,
+  "policy": "MultiInputPolicy",
+  "net_arch": [
+    256,
+    256
+  ],
+  "log_dir": "logs/assaultcube",
+  "checkpoint_freq": 10000,
+  "eval_freq": 5000,
+  "n_eval_episodes": 5,
+  "device": "auto",
+  "n_envs": 1,
+  "resumed_from": null,
+  "timesteps_done": 0,
+  "started_at": "2025-12-27T06:13:16.260902"
+}
