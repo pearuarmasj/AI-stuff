@@ -14,6 +14,13 @@ import pymem
 import pymem.process
 
 from .los_check import LOSChecker
+from ..memory.offsets import (
+    PLAYER1_PTR_OFFSET,
+    PLAYERS_ARRAY_OFFSET,
+    PLAYERS_COUNT_OFFSET,
+    POS_X, POS_Y, POS_Z,
+    HEALTH, TEAM,
+)
 
 
 @dataclass
@@ -46,18 +53,18 @@ class EnemyDetector:
 
     PROCESS_NAME = "ac_client.exe"
 
-    # AC 1.3.0.2 offsets (32-bit)
-    PLAYER1_PTR_OFFSET = 0x18AC00      # player1 pointer
-    PLAYERS_ARRAY_OFFSET = 0x18AC04    # pointer to playerent* array
-    PLAYERS_COUNT_OFFSET = 0x18AC0C    # number of players
+    # Offsets imported from centralized config (memory/offsets.py)
+    PLAYER1_PTR_OFFSET = PLAYER1_PTR_OFFSET
+    PLAYERS_ARRAY_OFFSET = PLAYERS_ARRAY_OFFSET
+    PLAYERS_COUNT_OFFSET = PLAYERS_COUNT_OFFSET
 
     # Playerent offsets
     OFFSETS = {
-        "pos_x": 0x04,
-        "pos_y": 0x08,
-        "pos_z": 0x0C,
-        "health": 0xEC,
-        "team": 0x30C,  # 0=CLA, 1=RVSF
+        "pos_x": POS_X,
+        "pos_y": POS_Y,
+        "pos_z": POS_Z,
+        "health": HEALTH,
+        "team": TEAM,
     }
 
     def __init__(self, fov_h: float = 90.0, fov_v: float = 60.0, use_los: bool = True):

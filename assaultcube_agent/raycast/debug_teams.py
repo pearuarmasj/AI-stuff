@@ -12,6 +12,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 import pymem
 import pymem.process
 
+from ..memory.offsets import (
+    PLAYER1_PTR_OFFSET,
+    PLAYERS_ARRAY_OFFSET,
+    PLAYERS_COUNT_OFFSET,
+    POS_X, POS_Y, POS_Z,
+    HEALTH, TEAM,
+)
+
 
 def main():
     print("=" * 70)
@@ -30,9 +38,9 @@ def main():
     print(f"[+] Attached, module base: 0x{module_base:X}")
 
     # Read player1 pointer
-    player1_ptr = pm.read_int(module_base + 0x18AC00)
-    array_ptr = pm.read_int(module_base + 0x18AC04)
-    player_count = pm.read_int(module_base + 0x18AC0C)
+    player1_ptr = pm.read_int(module_base + PLAYER1_PTR_OFFSET)
+    array_ptr = pm.read_int(module_base + PLAYERS_ARRAY_OFFSET)
+    player_count = pm.read_int(module_base + PLAYERS_COUNT_OFFSET)
 
     print(f"[+] player1: 0x{player1_ptr:X}")
     print(f"[+] players array: 0x{array_ptr:X}")
@@ -62,17 +70,13 @@ def main():
             is_self = player_ptr == player1_ptr
 
             # Read values
-            pos_x = pm.read_float(player_ptr + 0x04)
-            pos_y = pm.read_float(player_ptr + 0x08)
-            pos_z = pm.read_float(player_ptr + 0x0C)
-            health = pm.read_int(player_ptr + 0xEC)
-            team_1d8 = pm.read_int(player_ptr + 0x1D8)
+            pos_x = pm.read_float(player_ptr + POS_X)
+            pos_y = pm.read_float(player_ptr + POS_Y)
+            pos_z = pm.read_float(player_ptr + POS_Z)
+            health = pm.read_int(player_ptr + HEALTH)
+            team_val = pm.read_int(player_ptr + TEAM)
 
-            # Try other potential team offsets
-            team_32c = pm.read_int(player_ptr + 0x32C)
-            team_30c = pm.read_int(player_ptr + 0x30C)
-
-            print(f"  Player {i}: ptr=0x{player_ptr:X}, hp={health:3d}, team@1D8={team_1d8}, team@30C={team_30c}, team@32C={team_32c}, pos=({pos_x:.0f},{pos_y:.0f},{pos_z:.0f}) {'<- YOU' if is_self else ''}")
+            print(f"  Player {i}: ptr=0x{player_ptr:X}, hp={health:3d}, team={team_val}, pos=({pos_x:.0f},{pos_y:.0f},{pos_z:.0f}) {'<- YOU' if is_self else ''}")
         except Exception as e:
             print(f"  Player {i}: ERROR {e}")
 

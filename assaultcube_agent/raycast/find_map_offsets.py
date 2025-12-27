@@ -8,6 +8,8 @@ We need to find:
 3. Any traceline/raycube function we can call
 
 Run: python -m assaultcube_agent.raycast.find_map_offsets
+
+After finding, update WORLD_PTR_OFFSET, SSIZE_OFFSET in: memory/offsets.py
 """
 
 import sys
@@ -18,6 +20,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 import pymem
 import pymem.process
+
+from ..memory.offsets import PLAYER1_PTR_OFFSET
 
 
 def scan_for_pattern(pm, module_base, module_size, pattern: bytes, mask: str) -> list[int]:
@@ -139,10 +143,9 @@ def main():
 
     # Look for player1 and see what's near it (worldroot is often near player pointers)
     print("\n[*] Checking area around player1 pointer...")
-    player1_ptr_offset = 0x18AC00
 
     for delta in range(-0x100, 0x100, 4):
-        offset = player1_ptr_offset + delta
+        offset = PLAYER1_PTR_OFFSET + delta
         try:
             val = pm.read_int(module_base + offset)
             if 0x00100000 < val < 0x7FFFFFFF and val != 0:

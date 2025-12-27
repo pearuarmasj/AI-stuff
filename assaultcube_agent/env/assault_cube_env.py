@@ -137,9 +137,11 @@ class AssaultCubeEnv(gym.Env):
         # Reward tracking
         self._last_health = 100
         self._last_armor = 0
+        self._last_frags = 0
+        self._last_deaths = 0
         self._kills = 0
         self._deaths = 0
-        self._last_enemy_healths = {}
+        self._is_dead = False  # Track dead state to detect transitions
 
         print("=" * 60)
         print("Environment ready!")
@@ -200,50 +202,55 @@ class AssaultCubeEnv(gym.Env):
             return 0.0
 
         reward = 0.0
+        current_health = self._last_game_state.health
+        is_currently_dead = current_health <= 0
 
-        # Survival bonus
-        reward += 0.01
-
-        # Health change penalty
-        health_delta = self._last_game_state.health - self._last_health
-        if health_delta < 0:
-            reward += health_delta * 0.5  # Penalty for damage taken
-
-        # Track for next step
-        self._last_health = self._last_game_state.health
-        self._last_armor = self._last_game_state.armor
-
-        # Death penalty
-        if self._last_game_state.health <= 0:
+        # Detect death transition (alive -> dead) - only count ONCE
+        if is_currently_dead and not self._is_dead:
+            # Just died this frame
             reward -= 50.0
             self._deaths += 1
+            self._is_dead = True
+            print(f"[REWARD] DEATH! -50.0 (Total deaths: {self._deaths})")
+        elif not is_currently_dead and self._is_dead:
+            # Just respawned (dead -> alive)
+            self._is_dead = False
+            self._last_health = current_health  # Reset health tracking
+            print(f"[INFO] Respawned with {current_health} health")
+        elif not is_currently_dead:
+            # Alive - normal reward calculation
 
-        # Reward for aiming at visible enemies (in FOV with line-of-sight)
-        for e in self._last_enemies:
-            if e.in_fov and e.has_los:
-                # Small reward for having visible enemy in view
-                reward += 0.1
-                # Bonus for being close to center of view
-                aim_accuracy = 1.0 - (abs(e.angle_h) / 45.0)
-                if aim_accuracy > 0:
-                    reward += aim_accuracy * 0.2
+            # Survival bonus (only when alive)
+            reward += 0.01
 
-        # Track enemy health changes (kill detection)
-        for e in self._last_enemies:
-            enemy_key = e.index
-            if enemy_key in self._last_enemy_healths:
-                old_hp = self._last_enemy_healths[enemy_key]
-                if e.health < old_hp:
-                    # Dealt damage!
-                    damage = old_hp - e.health
-                    reward += damage * 0.5
-                    print(f"[REWARD] Dealt {damage} damage! +{damage * 0.5:.1f}")
-                if e.health <= 0 and old_hp > 0:
-                    # Kill!
-                    reward += 100.0
-                    self._kills += 1
-                    print(f"[REWARD] KILL! +100.0 (Total: {self._kills})")
-            self._last_enemy_healths[enemy_key] = e.health
+            # Health change penalty (only when alive, ignore respawn heal)
+            health_delta = current_health - self._last_health
+            if health_delta < 0:
+                reward += health_delta * 0.5  # Penalty for damage taken
+
+            # Reward for aiming at visible enemies (in FOV with line-of-sight)
+            for e in self._last_enemies:
+                if e.in_fov and e.has_los:
+                    # Small reward for having visible enemy in view
+                    reward += 0.1
+                    # Bonus for being close to center of view
+                    aim_accuracy = 1.0 - (abs(e.angle_h) / 45.0)
+                    if aim_accuracy > 0:
+                        reward += aim_accuracy * 0.2
+
+        # Track health for next step (only update when alive to avoid respawn delta)
+        if not is_currently_dead:
+            self._last_health = current_health
+            self._last_armor = self._last_game_state.armor
+
+        # Track frags from memory (proper kill detection) - works even when dead
+        current_frags = self._last_game_state.frags
+        if current_frags > self._last_frags:
+            new_kills = current_frags - self._last_frags
+            reward += new_kills * 100.0
+            self._kills += new_kills
+            print(f"[REWARD] KILL! +{new_kills * 100.0:.0f} (Total: {self._kills})")
+        self._last_frags = current_frags
 
         return reward
 
@@ -265,14 +272,40 @@ class AssaultCubeEnv(gym.Env):
 
         self._step_count = 0
         self._episode_reward = 0
-        self._last_health = 100
-        self._last_armor = 0
-        self._last_enemy_healths = {}
 
         self.action_mapper.reset()
-        time.sleep(0.5)
 
+        # Check if we're dead and need to respawn
         obs = self._get_observation()
+        if self._last_game_state and self._last_game_state.health <= 0:
+            print("[INFO] Dead - initiating respawn cycle...")
+
+            # Wait 3 seconds on death screen
+            time.sleep(3.0)
+
+            # Click mouse1 to respawn
+            self.action_mapper.click_to_respawn()
+
+            # Wait for respawn (health back to 100)
+            for _ in range(50):  # 5 second timeout
+                time.sleep(0.1)
+                obs = self._get_observation()
+                if self._last_game_state and self._last_game_state.health > 0:
+                    break
+
+            print(f"[INFO] Respawned with {self._last_game_state.health if self._last_game_state else '?'} health")
+
+        # Initialize tracking from ACTUAL current game state
+        if self._last_game_state:
+            self._last_frags = self._last_game_state.frags
+            self._last_deaths = self._last_game_state.deaths
+            self._is_dead = False  # We waited for respawn, so we're alive
+            self._last_health = self._last_game_state.health
+            self._last_armor = self._last_game_state.armor
+        else:
+            self._last_health = 100
+            self._last_armor = 0
+            self._is_dead = False
 
         info = {
             'episode_reward': self._episode_reward,

@@ -6,6 +6,8 @@ Find the team offset using differential scan.
 3. Find what changed
 
 Run: python -m assaultcube_agent.raycast.find_team_offset
+
+After finding, update TEAM in: memory/offsets.py
 """
 
 import sys
@@ -15,6 +17,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 import pymem
 import pymem.process
+
+from ..memory.offsets import PLAYER1_PTR_OFFSET
 
 
 def main():
@@ -34,7 +38,7 @@ def main():
     print(f"[+] Attached")
 
     # Read player1 pointer
-    player1_ptr = pm.read_int(module_base + 0x18AC00)
+    player1_ptr = pm.read_int(module_base + PLAYER1_PTR_OFFSET)
     print(f"[+] player1: 0x{player1_ptr:X}")
 
     # Step 1: Note current team
@@ -85,8 +89,8 @@ def main():
         print()
         print(f"Most likely team offset: 0x{candidates[0]:X}")
         print()
-        print("Update enemy_detector.py OFFSETS with:")
-        print(f'    "team": 0x{candidates[0]:X},')
+        print("Update memory/offsets.py with:")
+        print(f"    TEAM = 0x{candidates[0]:X}")
 
     pm.close_process()
     return 0

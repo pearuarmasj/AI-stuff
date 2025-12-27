@@ -6,6 +6,8 @@ Find the players vector offset using differential scanning.
 3. Scan again - find what changed
 
 Run: python -m assaultcube_agent.raycast.find_players_offset
+
+After finding, update PLAYERS_ARRAY_OFFSET in: memory/offsets.py
 """
 
 import sys
@@ -15,6 +17,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 import pymem
 import pymem.process
+
+from ..memory.offsets import PLAYER1_PTR_OFFSET, HEALTH, POS_X, POS_Y, POS_Z
 
 
 def scan_for_value(pm, module_base, value, scan_start=0x100000, scan_end=0x200000):
@@ -147,7 +151,7 @@ def main():
                                 print(f"    -> Vector at 0x{vec_offset:X}: count={count}")
 
                                 # Verify by reading player pointers
-                                player1_ptr = pm.read_int(module_base + 0x18AC00)
+                                player1_ptr = pm.read_int(module_base + PLAYER1_PTR_OFFSET)
                                 valid_players = 0
                                 has_player1 = False
 
@@ -157,7 +161,7 @@ def main():
                                         has_player1 = True
                                     # Check if has valid health
                                     try:
-                                        hp = pm.read_int(p_ptr + 0xEC)
+                                        hp = pm.read_int(p_ptr + HEALTH)
                                         if 0 <= hp <= 100:
                                             valid_players += 1
                                     except:
@@ -179,8 +183,8 @@ def main():
             print(f"[+] VERIFIED PLAYERS VECTOR OFFSET: 0x{verified[0]:X}")
             print("=" * 70)
             print()
-            print("Update enemy_detector.py with:")
-            print(f"    PLAYERS_VECTOR_OFFSET = 0x{verified[0]:X}")
+            print("Update memory/offsets.py with:")
+            print(f"    PLAYERS_ARRAY_OFFSET = 0x{verified[0]:X}")
             print()
 
             # Dump players
@@ -188,16 +192,16 @@ def main():
             data_ptr = pm.read_int(module_base + vec_offset)
             end_ptr = pm.read_int(module_base + vec_offset + 4)
             count = (end_ptr - data_ptr) // 4
-            player1_ptr = pm.read_int(module_base + 0x18AC00)
+            player1_ptr = pm.read_int(module_base + PLAYER1_PTR_OFFSET)
 
             print("Players:")
             for i in range(count):
                 p_ptr = pm.read_int(data_ptr + i * 4)
                 try:
-                    hp = pm.read_int(p_ptr + 0xEC)
-                    px = pm.read_float(p_ptr + 0x04)
-                    py = pm.read_float(p_ptr + 0x08)
-                    pz = pm.read_float(p_ptr + 0x0C)
+                    hp = pm.read_int(p_ptr + HEALTH)
+                    px = pm.read_float(p_ptr + POS_X)
+                    py = pm.read_float(p_ptr + POS_Y)
+                    pz = pm.read_float(p_ptr + POS_Z)
                     me = " <- YOU" if p_ptr == player1_ptr else ""
                     print(f"  [{i}] hp={hp:3d} pos=({px:.1f}, {py:.1f}, {pz:.1f}){me}")
                 except:

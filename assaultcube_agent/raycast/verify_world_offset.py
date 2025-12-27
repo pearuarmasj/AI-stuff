@@ -1,7 +1,6 @@
 """
 Verify world pointer offset based on found sfactor/ssize.
 
-sfactor=8, ssize=256 found at offset 0x182930.
 Layout should be: world(4), sfactor(4), ssize(4), cubicsize(4), mipsize(4)
 
 Run: python -m assaultcube_agent.raycast.verify_world_offset
@@ -15,16 +14,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 import pymem
 import pymem.process
 
-
-# sqr struct types from world.h
-SOLID = 0
-CORNER = 1
-FHF = 2
-CHF = 3
-SPACE = 4
-SEMISOLID = 5
-
-SQR_SIZE = 16  # sqr struct is 16 bytes
+from ..memory.offsets import (
+    SFACTOR_OFFSET,
+    SQR_SIZE,
+    SQR_SOLID as SOLID,
+    SQR_CORNER as CORNER,
+    SQR_FHF as FHF,
+    SQR_CHF as CHF,
+    SQR_SPACE as SPACE,
+    SQR_SEMISOLID as SEMISOLID,
+)
 
 
 def main():
@@ -42,8 +41,8 @@ def main():
 
     print(f"[+] Attached, module base: 0x{module_base:X}")
 
-    # Found sfactor at 0x182930
-    sfactor_offset = 0x182930
+    # Use sfactor offset from centralized config
+    sfactor_offset = SFACTOR_OFFSET
 
     # Read values around sfactor
     print(f"\n[*] Reading values around offset 0x{sfactor_offset:X}:")
@@ -136,7 +135,7 @@ def main():
             floor = pm.read_char(sqr_addr + 1)
             ceil = pm.read_char(sqr_addr + 2)
 
-            type_names = {0: "SOLID", 1: "CORNER", 2: "FHF", 3: "CHF", 4: "SPACE", 5: "SEMISOLID"}
+            type_names = {SOLID: "SOLID", CORNER: "CORNER", FHF: "FHF", CHF: "CHF", SPACE: "SPACE", SEMISOLID: "SEMISOLID"}
             print(f"  Position ({cx},{cy}): type={type_names.get(sqr_type, sqr_type)}, floor={floor}, ceil={ceil}")
 
     pm.close_process()

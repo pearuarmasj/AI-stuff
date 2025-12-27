@@ -137,6 +137,13 @@ class ActionMapper:
             self.mouse.release('left')
             self._shooting = False
 
+    def click_to_respawn(self):
+        """Click mouse1 to respawn after death."""
+        import time
+        self.mouse.press('left')
+        time.sleep(0.05)
+        self.mouse.release('left')
+
     def __del__(self):
         """Cleanup on destruction."""
         self.reset()

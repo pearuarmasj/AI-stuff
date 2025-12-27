@@ -4,11 +4,6 @@ Line-of-Sight checking for AssaultCube.
 Uses the world map data to check if there's a clear line between two points.
 Based on raycubelos() from AC source.
 
-Offsets found:
-  SFACTOR_OFFSET = 0x182930
-  SSIZE_OFFSET = 0x182934
-  WORLD_PTR_OFFSET = 0x182938
-
 Run test: python -m assaultcube_agent.raycast.los_check
 """
 
@@ -22,16 +17,20 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 import pymem
 import pymem.process
 
-
-# sqr types from world.h
-SOLID = 0
-CORNER = 1
-FHF = 2  # floor heightfield
-CHF = 3  # ceiling heightfield
-SPACE = 4
-SEMISOLID = 5
-
-SQR_SIZE = 16  # sqr struct size
+from ..memory.offsets import (
+    SFACTOR_OFFSET,
+    SSIZE_OFFSET,
+    WORLD_PTR_OFFSET,
+    SQR_SIZE,
+    SQR_SOLID as SOLID,
+    SQR_CORNER as CORNER,
+    SQR_FHF as FHF,
+    SQR_CHF as CHF,
+    SQR_SPACE as SPACE,
+    SQR_SEMISOLID as SEMISOLID,
+    PLAYER1_PTR_OFFSET,
+    POS_X, POS_Y, POS_Z, YAW,
+)
 
 
 class LOSChecker:
@@ -43,10 +42,10 @@ class LOSChecker:
 
     PROCESS_NAME = "ac_client.exe"
 
-    # Memory offsets (AC 1.3.0.2)
-    SFACTOR_OFFSET = 0x182930
-    SSIZE_OFFSET = 0x182934
-    WORLD_PTR_OFFSET = 0x182938
+    # Offsets imported from centralized config (memory/offsets.py)
+    SFACTOR_OFFSET = SFACTOR_OFFSET
+    SSIZE_OFFSET = SSIZE_OFFSET
+    WORLD_PTR_OFFSET = WORLD_PTR_OFFSET
 
     def __init__(self):
         self.pm: Optional[pymem.Pymem] = None
@@ -272,20 +271,20 @@ def test_los_checker():
 
     # Read player position for testing
     try:
-        player1_ptr = checker.pm.read_int(checker.module_base + 0x18AC00)
-        pos_x = checker.pm.read_float(player1_ptr + 0x04)
-        pos_y = checker.pm.read_float(player1_ptr + 0x08)
-        pos_z = checker.pm.read_float(player1_ptr + 0x0C)
+        player1_ptr = checker.pm.read_int(checker.module_base + PLAYER1_PTR_OFFSET)
+        pos_x = checker.pm.read_float(player1_ptr + POS_X)
+        pos_y = checker.pm.read_float(player1_ptr + POS_Y)
+        pos_z = checker.pm.read_float(player1_ptr + POS_Z)
         print(f"\n[+] Player position: ({pos_x:.1f}, {pos_y:.1f}, {pos_z:.1f})")
 
         # Test sqr at player position
         x, y = int(pos_x), int(pos_y)
         sqr_type, floor, ceil = checker._get_sqr(x, y)
-        type_names = {0: "SOLID", 1: "CORNER", 2: "FHF", 3: "CHF", 4: "SPACE", 5: "SEMISOLID"}
+        type_names = {SOLID: "SOLID", CORNER: "CORNER", FHF: "FHF", CHF: "CHF", SPACE: "SPACE", SEMISOLID: "SEMISOLID"}
         print(f"[+] Sqr at ({x},{y}): type={type_names.get(sqr_type, sqr_type)}, floor={floor}, ceil={ceil}")
 
         # Test ray in front of player
-        yaw = checker.pm.read_float(player1_ptr + 0x34)  # yaw offset
+        yaw = checker.pm.read_float(player1_ptr + YAW)
         print(f"[+] Player yaw: {yaw:.1f}")
 
         # Calculate direction from yaw

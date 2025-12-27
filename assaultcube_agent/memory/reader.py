@@ -13,6 +13,7 @@ import pymem
 import pymem.process
 
 from .structs import GameState, NUMGUNS
+from .offsets import PLAYER1_PTR_OFFSET, OFFSETS
 
 
 class ACMemoryReader:
@@ -29,41 +30,9 @@ class ACMemoryReader:
     # Process name (32-bit game)
     PROCESS_NAME = "ac_client.exe"
 
-    # Offsets for AC 1.3.0.2 (32-bit)
-    # If these don't work, use find_offsets.py to discover correct values
-    # Common player1 offsets to try: 0x10F4F4 (1.2.x), 0x18AC00 (1.3.x)
-    PLAYER1_PTR_OFFSET = 0x18AC00  # AC 1.3.0.2
-
-    # Offsets from player pointer
-    # Based on AC source structure analysis
-    OFFSETS = {
-        # Position (physent::o - vec at start of physent after vtable)
-        "pos_x": 0x04,
-        "pos_y": 0x08,
-        "pos_z": 0x0C,
-
-        # Velocity (physent::vel)
-        "vel_x": 0x10,
-        "vel_y": 0x14,
-        "vel_z": 0x18,
-
-        # View angles (after deltapos and newpos)
-        # vtable(4) + o(12) + vel(12) + deltapos(12) + newpos(12) = 0x34
-        "yaw": 0x34,
-        "pitch": 0x38,
-
-        # Health and armor (from playerstate, after dynent)
-        # Verified for AC 1.3.0.2
-        "health": 0xEC,
-        "armor": 0xF0,
-
-        # Weapon selection
-        "gunselect": 0x0,  # Needs discovery
-
-        # Ammo arrays (each NUMGUNS=9 ints)
-        "ammo_base": 0x0,  # Needs discovery
-        "mag_base": 0x0,   # Needs discovery
-    }
+    # Offsets imported from centralized config (memory/offsets.py)
+    PLAYER1_PTR_OFFSET = PLAYER1_PTR_OFFSET
+    OFFSETS = OFFSETS
 
     def __init__(self):
         self.pm: Optional[pymem.Pymem] = None
@@ -181,6 +150,10 @@ class ACMemoryReader:
         # Clamp health/armor to valid ranges
         state.health = max(0, min(100, state.health))
         state.armor = max(0, min(100, state.armor))
+
+        # Read frags/deaths
+        state.frags = self._read_int(self.OFFSETS["frags"])
+        state.deaths = self._read_int(self.OFFSETS["deaths"])
 
         return state
 

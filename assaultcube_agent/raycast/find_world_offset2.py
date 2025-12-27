@@ -5,6 +5,8 @@ The world pointer points to an array of sqr structs (16 bytes each).
 We look for pointers that point to memory with valid sqr patterns.
 
 Run: python -m assaultcube_agent.raycast.find_world_offset2
+
+After finding, update WORLD_PTR_OFFSET, SSIZE_OFFSET in: memory/offsets.py
 """
 
 import sys
@@ -15,14 +17,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 import pymem
 import pymem.process
 
-
-# sqr struct types from world.h
-SOLID = 0
-CORNER = 1
-FHF = 2
-CHF = 3
-SPACE = 4
-SEMISOLID = 5
+from ..memory.offsets import (
+    PLAYER1_PTR_OFFSET,
+    SQR_SIZE,
+    SQR_SOLID as SOLID,
+    SQR_CORNER as CORNER,
+    SQR_FHF as FHF,
+    SQR_CHF as CHF,
+    SQR_SPACE as SPACE,
+    SQR_SEMISOLID as SEMISOLID,
+)
 
 
 def validate_world_ptr(pm, ptr: int, expected_size: int = 0) -> tuple[bool, int]:
@@ -30,9 +34,6 @@ def validate_world_ptr(pm, ptr: int, expected_size: int = 0) -> tuple[bool, int]
     Check if ptr looks like a world pointer.
     Returns (is_valid, detected_ssize)
     """
-    # sqr struct is 16 bytes
-    SQR_SIZE = 16
-
     # Try to read first few sqr structs
     try:
         valid_sqrs = 0
@@ -79,8 +80,7 @@ def main():
     print(f"[+] Attached, module base: 0x{module_base:X}")
 
     # Known offsets for reference
-    player1_offset = 0x18AC00
-    print(f"[+] player1 at offset 0x{player1_offset:X}")
+    print(f"[+] player1 at offset 0x{PLAYER1_PTR_OFFSET:X}")
 
     # Scan the data segment for heap pointers
     print("\n[*] Scanning data segment for world pointer candidates...")
