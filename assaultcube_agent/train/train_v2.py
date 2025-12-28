@@ -24,6 +24,8 @@ from pathlib import Path
 from dataclasses import dataclass, asdict, field
 from typing import Literal, Optional
 
+import torch
+import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import (
     CheckpointCallback,
@@ -68,8 +70,8 @@ class TrainingConfigV2:
 
     # Logging
     log_dir: str = "logs/assaultcube_v2"
-    checkpoint_freq: int = 10000
-    eval_freq: int = 5000
+    checkpoint_freq: int = 50000  # ~3 min at 280 fps
+    eval_freq: int = 25000
     n_eval_episodes: int = 3
 
     # Hardware
@@ -106,6 +108,83 @@ class EmergencyStopCallback(BaseCallback):
                         unwrapped.action_mapper.reset()
         except:
             pass
+
+
+class NeuralNetworkVisualizerCallback(BaseCallback):
+    """
+    Callback to visualize neural network weights and biases during training.
+
+    Logs to TensorBoard:
+    - Weight/bias statistics (mean, std, min, max) for each layer
+    - Weight distributions as histograms
+    - Network architecture summary
+    """
+
+    def __init__(self, log_freq: int = 2048, verbose: int = 1):
+        super().__init__(verbose)
+        self.log_freq = log_freq
+        self._printed_architecture = False
+
+    def _on_training_start(self) -> None:
+        """Print network architecture at start of training."""
+        if self._printed_architecture:
+            return
+
+        print("\n" + "=" * 70)
+        print("  NEURAL NETWORK ARCHITECTURE")
+        print("=" * 70)
+
+        policy = self.model.policy
+        total_params = 0
+
+        print("\n  [LAYERS]")
+        for name, param in policy.named_parameters():
+            num_params = param.numel()
+            total_params += num_params
+            shape_str = "x".join(str(s) for s in param.shape)
+            print(f"    {name}: {shape_str} = {num_params:,} params")
+
+        print(f"\n  [TOTAL: {total_params:,} learnable parameters]")
+        print("=" * 70 + "\n")
+        self._printed_architecture = True
+
+    def _on_step(self) -> bool:
+        """Log weight statistics periodically."""
+        if self.n_calls % self.log_freq != 0:
+            return True
+
+        policy = self.model.policy
+
+        # Log weight statistics for each layer
+        for name, param in policy.named_parameters():
+            if param.requires_grad:
+                data = param.data.cpu().numpy()
+
+                # Log scalar statistics
+                self.logger.record(f"nn/{name}/mean", float(np.mean(data)))
+                self.logger.record(f"nn/{name}/std", float(np.std(data)))
+                self.logger.record(f"nn/{name}/min", float(np.min(data)))
+                self.logger.record(f"nn/{name}/max", float(np.max(data)))
+                self.logger.record(f"nn/{name}/abs_mean", float(np.mean(np.abs(data))))
+
+                # Log gradient statistics if available
+                if param.grad is not None:
+                    grad = param.grad.cpu().numpy()
+                    self.logger.record(f"nn_grad/{name}/mean", float(np.mean(grad)))
+                    self.logger.record(f"nn_grad/{name}/std", float(np.std(grad)))
+
+        return True
+
+    def _on_rollout_end(self) -> None:
+        """Print weight summary at end of each rollout (optional verbose)."""
+        if self.verbose < 2:
+            return
+
+        print("\n  [NN Weights Summary]")
+        for name, param in self.model.policy.named_parameters():
+            if "weight" in name and param.requires_grad:
+                data = param.data.cpu().numpy()
+                print(f"    {name}: mean={np.mean(data):.4f}, std={np.std(data):.4f}")
 
 
 def make_env(config: TrainingConfigV2, render_mode: Optional[str] = None):
@@ -187,6 +266,7 @@ def train(config: TrainingConfigV2, resume_from: Optional[str] = None):
             name_prefix="model",
         ),
         EmergencyStopCallback(env),
+        NeuralNetworkVisualizerCallback(log_freq=config.n_steps, verbose=1),
     ]
 
     # Start emergency stop listener

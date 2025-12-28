@@ -28,6 +28,7 @@ from gymnasium import spaces
 from ..memory import ACMemoryReader
 from ..control import ActionMapper, check_stop
 from ..raycast import OmniRaycastObserver
+from ..raycast.enemy_detector import EnemyDetector
 
 
 class OmniAssaultCubeEnv(gym.Env):
@@ -80,11 +81,14 @@ class OmniAssaultCubeEnv(gym.Env):
             raise RuntimeError("Failed to attach to AssaultCube!")
         print("[+] Memory reader attached")
 
+        # Calculate vertical FOV from min/max
+        fov_v = vertical_max - vertical_min  # e.g., 60 - (-60) = 120°
+
         self.raycast = OmniRaycastObserver(
             horizontal_rays=horizontal_rays,
             vertical_layers=vertical_layers,
-            vertical_min=vertical_min,
-            vertical_max=vertical_max,
+            fov_h=360.0,  # Full 360° omnidirectional
+            fov_v=fov_v,
             max_distance=max_ray_distance,
         )
         if not self.raycast.attach():
@@ -92,6 +96,14 @@ class OmniAssaultCubeEnv(gym.Env):
 
         self.action_mapper = ActionMapper(aim_scale=aim_scale)
         print("[+] Action mapper ready")
+
+        # Enemy detector for precise angle calculations
+        self.enemy_detector = EnemyDetector(fov_h=360.0, fov_v=120.0, use_los=True)
+        if not self.enemy_detector.attach():
+            print("[!] Warning: EnemyDetector failed to attach (aim rewards disabled)")
+            self.enemy_detector = None
+        else:
+            print("[+] Enemy detector attached")
 
         # Observation space
         self.observation_space = spaces.Dict({
@@ -121,6 +133,13 @@ class OmniAssaultCubeEnv(gym.Env):
         self._deaths = 0
         self._total_damage = 0  # Total damage in episode
 
+        # Weapon tracking (for shot efficiency rewards)
+        self._last_ammo = 0
+
+        # View stabilization tracking
+        self._stare_counter = 0
+        self._last_dominant_view = None
+
         # Anti-stuck
         self._position_history: deque = deque(maxlen=stuck_history)
 
@@ -142,6 +161,234 @@ class OmniAssaultCubeEnv(gym.Env):
             if math.sqrt(sum((a-b)**2 for a, b in zip(pos, current))) < self.stuck_threshold
         )
         return same_count / (len(self._position_history) - 1)
+
+    # =========================================================================
+    # DENSE REWARD HELPERS
+    # =========================================================================
+
+    def _get_center_rays(self) -> np.ndarray:
+        """
+        Extract CENTER vertical layers (horizon ± 2) for view detection.
+
+        Only these rays matter for detecting if agent is ACTUALLY staring at sky/floor,
+        vs just having sky naturally visible in peripheral upper rays.
+        """
+        if self._last_rays is None:
+            return np.array([])
+
+        # Reshape to (v_layers, h_rays, 2)
+        rays = self._last_rays.reshape(self.v_layers, self.h_rays, 2)
+
+        # Center layers: middle ± 2 (or ± 1 if few layers)
+        mid = self.v_layers // 2
+        margin = min(2, mid)  # ±2 layers, but handle small v_layers
+
+        start = max(0, mid - margin)
+        end = min(self.v_layers, mid + margin + 1)
+
+        # Extract center layers and flatten
+        center = rays[start:end, :, :]
+        return center.reshape(-1, 2)
+
+    def _calc_view_reward(self) -> float:
+        """
+        Penalize staring at sky/floor/walls using CENTER rays only.
+
+        - Sky staring (>50% center rays hit sky): -3.0 immediate
+        - Wall/floor staring (>70% same type): -0.5 escalating
+        """
+        center_rays = self._get_center_rays()
+        if len(center_rays) == 0:
+            return 0.0
+
+        hit_types = center_rays[:, 1]
+        total = len(hit_types)
+
+        # Count hit types (from omni_raycast: 0=nothing, 0.33=wall, 0.67=enemy, 1.0=sky)
+        sky_count = np.sum(hit_types > 0.9)      # ~1.0 = sky
+        wall_count = np.sum((hit_types > 0.25) & (hit_types < 0.45))  # ~0.33 = wall
+        nothing_count = np.sum(hit_types < 0.15)  # ~0.0 = nothing/max distance
+
+        sky_ratio = sky_count / total
+        wall_ratio = wall_count / total
+        nothing_ratio = nothing_count / total
+
+        reward = 0.0
+
+        # SKY STARING - immediate punishment (but reduced)
+        if sky_ratio > 0.5:
+            # Scale by how bad it is (0.5 = -0.5, 1.0 = -1.0)
+            reward = -0.5 * (sky_ratio / 0.5)
+            self._stare_counter = 0
+            self._last_dominant_view = 'sky'
+            return reward
+
+        # WALL/FLOOR STARING - only punish after LONG staring (30+ frames)
+        # Walls are everywhere during navigation - don't punish normal play
+        dominant = None
+        if wall_ratio > 0.8:  # Increased threshold
+            dominant = 'wall'
+        elif nothing_ratio > 0.8:  # Increased threshold
+            dominant = 'floor'
+
+        if dominant:
+            if dominant == self._last_dominant_view:
+                self._stare_counter += 1
+                # Only start punishing after 30 frames of staring
+                if self._stare_counter > 30:
+                    # Gentle escalation: -0.1 base, +0.02 per frame over 30
+                    escalation = min((self._stare_counter - 30) * 0.02, 0.4)
+                    reward = -0.1 - escalation
+            else:
+                self._stare_counter = 1
+            self._last_dominant_view = dominant
+        else:
+            # Not staring - reset
+            self._stare_counter = 0
+            self._last_dominant_view = None
+
+        return reward
+
+    def _calc_aim_reward(self) -> float:
+        """
+        Angle-based aiming reward using EnemyDetector.
+
+        - Dead center on enemy: +2.0
+        - Inside hitbox (gradient): +0.0 to +0.5
+        - Outside hitbox: -0.2 flat + -0.01/degree (cap -1.0)
+        - No enemies visible: 0.0
+        """
+        if self.enemy_detector is None or self._last_game_state is None:
+            return 0.0
+
+        gs = self._last_game_state
+
+        # Get enemies with LOS
+        enemies = self.enemy_detector.detect_enemies(
+            own_pos=(gs.pos_x, gs.pos_y, gs.pos_z),
+            own_yaw=gs.yaw,
+            own_pitch=gs.pitch,
+            max_distance=250.0,
+            filter_team=True,
+            filter_los=True,
+        )
+
+        if not enemies:
+            return 0.0  # No enemies visible - neutral
+
+        # Find closest enemy
+        closest = min(enemies, key=lambda e: e.distance)
+
+        # Angular distance from crosshair (0,0) to enemy
+        angle_off = math.sqrt(closest.angle_h**2 + closest.angle_v**2)
+
+        # Hitbox angular size depends on distance (closer = bigger target)
+        # 5.0 unit hitbox radius at distance D = atan2(5.0, D) degrees
+        hitbox_angle = math.degrees(math.atan2(5.0, max(closest.distance, 1.0)))
+
+        if angle_off <= hitbox_angle:
+            # INSIDE HITBOX - gradient reward
+            precision = 1.0 - (angle_off / hitbox_angle)  # 1.0 = dead center
+
+            if precision > 0.95:
+                return 2.0  # Dead center - big reward
+            else:
+                return 0.5 * precision  # Gradient: 0.0 to 0.5
+        else:
+            # OUTSIDE HITBOX - REWARD for getting closer, small penalty for far off
+            # This encourages turning toward enemies instead of punishing exploration
+            if angle_off < 30.0:
+                # Within 30 degrees - reward for being close
+                return 0.1 * (1.0 - angle_off / 30.0)  # +0.1 at 0°, +0.0 at 30°
+            elif angle_off < 90.0:
+                # 30-90 degrees - neutral, agent is trying
+                return 0.0
+            else:
+                # >90 degrees - very small penalty (enemy behind you)
+                return -0.05
+
+    def _is_aiming_at_enemy(self) -> bool:
+        """Check if center rays are hitting an enemy."""
+        if self._last_rays is None:
+            return False
+
+        # Check center region (5x5 around crosshair)
+        rays = self._last_rays.reshape(self.v_layers, self.h_rays, 2)
+        mid_v = self.v_layers // 2
+        mid_h = self.h_rays // 2
+
+        for dv in range(-2, 3):
+            for dh in range(-2, 3):
+                v = mid_v + dv
+                h = mid_h + dh
+                if 0 <= v < self.v_layers and 0 <= h < self.h_rays:
+                    hit_type = rays[v, h, 1]
+                    if 0.6 < hit_type < 0.8:  # ~0.67 = enemy
+                        return True
+        return False
+
+    def _any_enemy_in_los(self) -> bool:
+        """Check if any ray hit an enemy."""
+        if self._last_rays is None:
+            return False
+        hit_types = self._last_rays[:, 1]
+        return np.any((hit_types > 0.6) & (hit_types < 0.8))
+
+    def _calc_weapon_reward(self) -> float:
+        """
+        Shot efficiency reward based on ammo tracking.
+
+        - Aimed hit: +3.0 per shot
+        - Lucky hit: +0.5 per shot
+        - Aimed miss (spread): +0.1 per shot
+        - Aimed miss (bad aim): -0.3 per shot
+        - No enemy in LOS shot: -0.5 scaled by low ammo
+        - Ammo pickup: +0.5 per bullet
+        """
+        if self._last_game_state is None:
+            return 0.0
+
+        gs = self._last_game_state
+        reward = 0.0
+
+        # Detect ammo changes
+        current_ammo = gs.ammo_mag
+        ammo_diff = self._last_ammo - current_ammo
+
+        if ammo_diff < 0:
+            # Ammo increased = pickup (or reload, but reward anyway)
+            reward += 0.5 * abs(ammo_diff)
+
+        shots_fired = max(0, ammo_diff)
+
+        if shots_fired > 0:
+            # Check if we dealt damage this step
+            damage_diff = gs.damage_dealt - self._last_damage_dealt
+            hit_something = damage_diff > 0
+
+            # Check aiming status
+            was_aiming = self._is_aiming_at_enemy()
+            enemy_in_los = self._any_enemy_in_los()
+
+            if hit_something:
+                if was_aiming:
+                    reward += 3.0 * shots_fired  # Aimed hit - BIG reward
+                else:
+                    reward += 1.0 * shots_fired  # Lucky hit - still good
+            else:
+                # Missed - reduced penalties
+                if not enemy_in_los:
+                    # Shooting at nothing - small penalty
+                    reward += -0.1 * shots_fired
+                elif was_aiming:
+                    # Was aiming but missed - neutral (spread happens)
+                    reward += 0.0
+                else:
+                    # Enemy visible but not aiming - tiny penalty
+                    reward += -0.05 * shots_fired
+
+        self._last_ammo = current_ammo
+        return reward
 
     def _get_observation(self) -> dict:
         """Get observation."""
@@ -166,7 +413,16 @@ class OmniAssaultCubeEnv(gym.Env):
         return {'player': player_obs, 'rays': rays}
 
     def _calculate_reward(self) -> float:
-        """Calculate reward."""
+        """
+        Calculate comprehensive dense reward.
+
+        Components:
+        - Aim reward: Continuous feedback on crosshair positioning
+        - View reward: Anti-sky/floor staring
+        - Weapon reward: Shot efficiency
+        - Damage/kills: Combat success
+        - Survival/movement: Basic behaviors
+        """
         if self._last_game_state is None:
             return 0.0
 
@@ -174,77 +430,63 @@ class OmniAssaultCubeEnv(gym.Env):
         gs = self._last_game_state
         is_dead = gs.health <= 0
 
-        # Death
+        # === DEATH HANDLING ===
         if is_dead and not self._is_dead:
-            reward -= 50.0
             self._deaths += 1
             self._is_dead = True
-            return reward
+            return -50.0  # Death penalty
         elif not is_dead and self._is_dead:
+            # Just respawned
             self._is_dead = False
             self._last_health = gs.health
-            return reward
+            self._last_ammo = gs.ammo_mag  # Reset ammo tracking
+            return 0.0
         elif is_dead:
-            return reward
+            return 0.0  # Dead, waiting to respawn
 
-        # Alive
-        reward += 0.01  # Survival
+        # === DENSE REWARDS (NEW) ===
+
+        # 1. Aim reward - continuous feedback on crosshair positioning
+        aim_reward = self._calc_aim_reward()
+        reward += aim_reward
+
+        # 2. View reward - anti-sky/floor staring
+        view_reward = self._calc_view_reward()
+        reward += view_reward
+
+        # 3. Weapon reward - shot efficiency
+        weapon_reward = self._calc_weapon_reward()
+        reward += weapon_reward
+
+        # === EXISTING REWARDS (rebalanced) ===
+
+        # Survival (reduced - dense rewards provide more signal)
+        reward += 0.005
 
         # Damage taken
         if gs.health < self._last_health:
-            reward -= (self._last_health - gs.health) * 0.3
+            damage_taken = self._last_health - gs.health
+            reward -= damage_taken * 0.4
         self._last_health = gs.health
 
-        # Enemy detection - ONLY reward for enemies in FOV (where agent is looking)
-        # Rays are relative to player yaw: ray 0 = forward, ray 36 = behind (for 72 rays)
-        # FOV is ±45° = rays 0-9 (right) and 63-71 (left) for 72 horizontal rays
-        if self._last_rays is not None:
-            hit_types = self._last_rays[:, 1]
-
-            # Count enemies ONLY in forward FOV (±45° = 90° total)
-            fov_half = self.h_rays // 8  # 9 rays = 45° for 72 rays
-            fov_enemy_rays = 0
-
-            for layer in range(self.v_layers):
-                layer_start = layer * self.h_rays
-                # Front-right: rays 0 to fov_half
-                for i in range(fov_half + 1):
-                    if hit_types[layer_start + i] > 0.9:
-                        fov_enemy_rays += 1
-                # Front-left: rays (h_rays - fov_half) to (h_rays - 1)
-                for i in range(self.h_rays - fov_half, self.h_rays):
-                    if hit_types[layer_start + i] > 0.9:
-                        fov_enemy_rays += 1
-
-            # Strong reward for enemies in FOV - this is what we want!
-            if fov_enemy_rays > 0:
-                reward += 0.5 * min(fov_enemy_rays, 10)
-
-            # Small awareness bonus for enemies detected anywhere (encourages not ignoring threats)
-            # But much weaker than FOV reward
-            total_enemy_rays = np.sum(hit_types > 0.9)
-            if total_enemy_rays > 0 and fov_enemy_rays == 0:
-                # Enemy nearby but not looking at them - tiny bonus just for awareness
-                reward += 0.01
-
-        # Damage dealt to enemies - MAJOR reward signal
+        # Damage dealt (reduced - weapon reward covers some of this)
         if gs.damage_dealt > self._last_damage_dealt:
             damage_this_step = gs.damage_dealt - self._last_damage_dealt
-            reward += damage_this_step * 1.0  # +1 per damage point dealt
+            reward += damage_this_step * 0.5  # Reduced from 1.0
             self._total_damage += damage_this_step
         self._last_damage_dealt = gs.damage_dealt
 
-        # Kill (on top of damage reward)
+        # Kill bonus (reduced - aim+weapon rewards help)
         if gs.frags > self._last_frags:
             new_kills = gs.frags - self._last_frags
-            reward += 50.0 * new_kills  # Bonus for securing the kill
+            reward += 30.0 * new_kills  # Reduced from 50.0
             self._kills += new_kills
         self._last_frags = gs.frags
 
-        # Movement bonus
+        # Movement bonus (encourages not camping)
         velocity = math.sqrt(gs.vel_x**2 + gs.vel_y**2)
         if velocity > 10.0:
-            reward += 0.005
+            reward += 0.002
 
         # Anti-stuck
         stuck = self._get_stuck_ratio()
@@ -296,8 +538,13 @@ class OmniAssaultCubeEnv(gym.Env):
             self._last_frags = self._last_game_state.frags
             self._last_health = self._last_game_state.health
             self._last_damage_dealt = self._last_game_state.damage_dealt
+            self._last_ammo = self._last_game_state.ammo_mag  # For weapon tracking
             self._is_dead = False
             self._total_damage = 0
+
+        # Reset view stabilization tracking
+        self._stare_counter = 0
+        self._last_dominant_view = None
 
         return obs, {'kills': self._kills, 'deaths': self._deaths, 'damage': self._total_damage}
 
@@ -368,6 +615,8 @@ class OmniAssaultCubeEnv(gym.Env):
         self.action_mapper.reset()
         self.memory_reader.detach()
         self.raycast.detach()
+        if self.enemy_detector:
+            self.enemy_detector.detach()
 
         if self._step_times:
             print(f"\n[OmniEnv] Final FPS: {self._last_fps:.0f}")
