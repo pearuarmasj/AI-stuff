@@ -22,30 +22,46 @@ from ..memory.offsets import (
     SSIZE_OFFSET,
     WORLD_PTR_OFFSET,
     SQR_SIZE,
-    SQR_SOLID as SOLID,
 )
 
+# Cube types (from world.h)
+SOLID = 0
+CORNER = 1
+FHF = 2      # Floor heightfield
+CHF = 3      # Ceiling heightfield
+SPACE = 4    # Open space (but has floor/ceil)
+SEMISOLID = 5
 
 # Hit types
 HIT_NOTHING = 0
 HIT_WALL = 1
 HIT_ENEMY = 2
+HIT_SKY = 3
+
+# Default sky texture
+DEFAULT_SKY_TEXTURE = 0
+
+# Player body height offset - positions read from memory are at foot level,
+# but we want to check collision at body center for proper detection
+PLAYER_BODY_CENTER_OFFSET = 4.0  # Half player height (~8 units total)
 
 
 @njit(cache=True)
 def trace_ray_numba(
     ox: float, oy: float, oz: float,
     dx: float, dy: float, dz: float,
-    world_types: np.ndarray,
+    world_data: np.ndarray,  # (type, floor, ceil, ctex, vdelta) per sqr
     ssize: int,
     enemies: np.ndarray,
     num_enemies: int,
     max_dist: float,
     step_size: float,
     enemy_radius_sq: float,
+    sky_texture: int,
 ) -> tuple:
     """
     Trace a single ray through the world (numba-compiled).
+    Properly checks SOLID, CORNER, SEMISOLID, and floor/ceil collisions.
 
     Returns (normalized_distance, hit_type)
     """
@@ -53,20 +69,42 @@ def trace_ray_numba(
     vx, vy, vz = ox, oy, oz
 
     while dist < max_dist:
-        # Check bounds and wall
         ix, iy = int(vx), int(vy)
+
+        # Check bounds
         if ix < 0 or iy < 0 or ix >= ssize or iy >= ssize:
+            if dz > 0.0:
+                return dist / max_dist, HIT_SKY
             return dist / max_dist, HIT_WALL
 
-        if world_types[iy * ssize + ix] == SOLID:
+        idx = iy * ssize + ix
+        sqr_type = int(world_data[idx, 0])
+        sqr_floor = world_data[idx, 1]
+        sqr_ceil = world_data[idx, 2]
+        sqr_ctex = int(world_data[idx, 3])
+        sqr_vdelta = world_data[idx, 4]
+
+        # Apply vdelta adjustment for heightfield cubes
+        floor_z = sqr_floor
+        ceil_z = sqr_ceil
+        if sqr_type == FHF:
+            floor_z -= sqr_vdelta / 4.0
+        if sqr_type == CHF:
+            ceil_z += sqr_vdelta / 4.0
+
+        # Check solid cube types
+        if sqr_type == SOLID or sqr_type == CORNER or sqr_type == SEMISOLID:
+            return dist / max_dist, HIT_WALL
+
+        # Check floor/ceiling collision
+        if vz < floor_z or vz > ceil_z:
+            if vz > ceil_z and sqr_ctex == sky_texture and dz > 0:
+                return dist / max_dist, HIT_SKY
             return dist / max_dist, HIT_WALL
 
         # Check enemies
         for i in range(num_enemies):
-            ex = enemies[i, 0]
-            ey = enemies[i, 1]
-            ez = enemies[i, 2]
-            dist_sq = (vx - ex)**2 + (vy - ey)**2 + (vz - ez)**2
+            dist_sq = (vx - enemies[i, 0])**2 + (vy - enemies[i, 1])**2 + (vz - enemies[i, 2])**2
             if dist_sq < enemy_radius_sq:
                 return dist / max_dist, HIT_ENEMY
 
@@ -76,6 +114,9 @@ def trace_ray_numba(
         vz += dz * step_size
         dist += step_size
 
+    # Reached max distance
+    if dz > 0.0:
+        return 1.0, HIT_SKY
     return 1.0, HIT_NOTHING
 
 
@@ -83,13 +124,14 @@ def trace_ray_numba(
 def trace_all_rays_numba(
     origin: np.ndarray,
     directions: np.ndarray,
-    world_types: np.ndarray,
+    world_data: np.ndarray,  # (type, floor, ceil, ctex, vdelta) per sqr
     ssize: int,
     enemies: np.ndarray,
     num_enemies: int,
     max_dist: float,
     step_size: float,
     enemy_radius_sq: float,
+    sky_texture: int,
     output: np.ndarray,
 ):
     """
@@ -105,12 +147,12 @@ def trace_all_rays_numba(
 
         dist, hit = trace_ray_numba(
             ox, oy, oz, dx, dy, dz,
-            world_types, ssize, enemies, num_enemies,
-            max_dist, step_size, enemy_radius_sq
+            world_data, ssize, enemies, num_enemies,
+            max_dist, step_size, enemy_radius_sq, sky_texture
         )
 
         output[i, 0] = dist
-        output[i, 1] = hit / 2.0  # Normalize hit type to 0-1
+        output[i, 1] = hit / 3.0  # Normalize: 0=nothing, 0.33=wall, 0.67=enemy, 1.0=sky
 
 
 @njit(cache=True)
@@ -145,14 +187,14 @@ def compute_ray_directions(
 
 class NumbaRaycastObserver:
     """
-    Numba-accelerated raycast observation.
+    Numba-accelerated raycast observation with proper wall detection.
 
     Configuration:
         - FOV rays: 41x17 = 697 rays (dense combat coverage)
-        - Omni rays: 24 rays at ground level (360° navigation)
-        - Total: 721 rays
+        - Omni rays: 72 rays at ground level (360° navigation, 5° resolution)
+        - Total: 769 rays
 
-    This should achieve 150+ fps on modern hardware.
+    Properly detects walls via floor/ceiling heights, CORNER, and SEMISOLID cubes.
     """
 
     PROCESS_NAME = "ac_client.exe"
@@ -167,12 +209,12 @@ class NumbaRaycastObserver:
         fov_max_dist: float = 350.0,
 
         # Omni configuration (360° spatial awareness for navigation)
-        omni_rays: int = 36,  # 10° resolution (was 24 = 15° gaps)
+        omni_rays: int = 72,  # 5° resolution for smooth radar
         omni_max_dist: float = 150.0,
 
         # Tracing config
-        step_size: float = 2.0,
-        enemy_hitbox_radius: float = 4.0,
+        step_size: float = 0.5,  # Smaller step for accurate wall detection
+        enemy_hitbox_radius: float = 5.0,
     ):
         self.fov_rays_h = fov_rays_h
         self.fov_rays_v = fov_rays_v
@@ -183,16 +225,17 @@ class NumbaRaycastObserver:
         self.omni_max_dist = omni_max_dist
         self.step_size = step_size
         self.enemy_radius_sq = enemy_hitbox_radius ** 2
+        self.sky_texture = DEFAULT_SKY_TEXTURE
 
         # Memory
         self.pm: Optional[pymem.Pymem] = None
         self.module_base: int = 0
         self._attached = False
 
-        # World data
+        # World data (type, floor, ceil, ctex, vdelta)
         self._ssize: int = 0
         self._world_ptr: int = 0
-        self._world_types: Optional[np.ndarray] = None
+        self._world_data: Optional[np.ndarray] = None
 
         # Counts
         self.total_fov = fov_rays_h * fov_rays_v
@@ -275,7 +318,7 @@ class NumbaRaycastObserver:
         self._attached = False
 
     def _refresh_world(self):
-        """Read world geometry into numpy array."""
+        """Read world geometry with floor/ceil/vdelta/ctex for proper collision detection."""
         if not self.pm:
             return
 
@@ -283,19 +326,28 @@ class NumbaRaycastObserver:
             self._ssize = self.pm.read_int(self.module_base + SSIZE_OFFSET)
             self._world_ptr = self.pm.read_int(self.module_base + WORLD_PTR_OFFSET)
 
-            # Read all sqr types into array (first byte of each sqr is type)
-            # This is the expensive operation - we cache it
             total_sqrs = self._ssize * self._ssize
             world_bytes = self.pm.read_bytes(self._world_ptr, total_sqrs * SQR_SIZE)
 
-            # Extract just the type byte from each sqr
-            self._world_types = np.array([
-                world_bytes[i * SQR_SIZE] for i in range(total_sqrs)
-            ], dtype=np.uint8)
+            # sqr struct layout (from world.h):
+            # 0: type, 1: floor, 2: ceil, 3: wtex, 4: ftex, 5: ctex, 6-8: rgb, 9: vdelta
+            raw = np.frombuffer(world_bytes, dtype=np.uint8).reshape(total_sqrs, SQR_SIZE)
+
+            self._world_data = np.zeros((total_sqrs, 5), dtype=np.float64)
+            self._world_data[:, 0] = raw[:, 0]  # type (uchar)
+
+            # floor and ceil are signed chars (-128 to 127)
+            floor_u8 = raw[:, 1].astype(np.int16)
+            ceil_u8 = raw[:, 2].astype(np.int16)
+            self._world_data[:, 1] = np.where(floor_u8 < 128, floor_u8, floor_u8 - 256)
+            self._world_data[:, 2] = np.where(ceil_u8 < 128, ceil_u8, ceil_u8 - 256)
+
+            self._world_data[:, 3] = raw[:, 5]  # ctex (ceiling texture) - byte 5
+            self._world_data[:, 4] = raw[:, 9]  # vdelta for heightfields
 
         except Exception as e:
             print(f"[NumbaRaycast] World refresh failed: {e}")
-            self._world_types = np.zeros(1, dtype=np.uint8)
+            self._world_data = np.zeros((1, 5), dtype=np.float64)
 
     def _read_player_data(self) -> tuple:
         """Read player position and angles."""
@@ -314,7 +366,11 @@ class NumbaRaycastObserver:
             return (0, 0, 0), 0, 0, 0
 
     def _read_enemies(self, own_team: int) -> int:
-        """Read enemy positions into preallocated array. Returns count."""
+        """Read enemy positions into preallocated array. Returns count.
+
+        Note: Enemy Z position is offset by PLAYER_BODY_CENTER_OFFSET to check
+        collision at body center rather than feet.
+        """
         count = 0
         try:
             player1_ptr = self.pm.read_int(self.module_base + PLAYER1_PTR_OFFSET)
@@ -336,7 +392,8 @@ class NumbaRaycastObserver:
 
                 self._enemies[count, 0] = self.pm.read_float(ptr + POS_X)
                 self._enemies[count, 1] = self.pm.read_float(ptr + POS_Y)
-                self._enemies[count, 2] = self.pm.read_float(ptr + POS_Z)
+                # Add offset to check at body center, not feet
+                self._enemies[count, 2] = self.pm.read_float(ptr + POS_Z) + PLAYER_BODY_CENTER_OFFSET
                 count += 1
 
                 if count >= 32:
@@ -354,7 +411,7 @@ class NumbaRaycastObserver:
             fov_rays: (total_fov, 2) - [distance, hit_type] per ray
             omni_rays: (total_omni, 2) - [distance, hit_type] per ray
         """
-        if not self._attached or self._world_types is None:
+        if not self._attached or self._world_data is None:
             return (
                 np.zeros((self.total_fov, 2), dtype=np.float32),
                 np.zeros((self.total_omni, 2), dtype=np.float32),
@@ -363,6 +420,8 @@ class NumbaRaycastObserver:
         # Get player data
         pos, yaw, pitch, own_team = self._read_player_data()
         self._origin[0], self._origin[1], self._origin[2] = pos
+        # Offset Z to eye level (same as enemy body center offset)
+        self._origin[2] += PLAYER_BODY_CENTER_OFFSET
 
         # Get enemies
         num_enemies = self._read_enemies(own_team)
@@ -373,10 +432,10 @@ class NumbaRaycastObserver:
         # Trace FOV rays (parallel)
         trace_all_rays_numba(
             self._origin, self._fov_directions,
-            self._world_types, self._ssize,
+            self._world_data, self._ssize,
             self._enemies, num_enemies,
             self.fov_max_dist, self.step_size, self.enemy_radius_sq,
-            self._fov_output
+            self.sky_texture, self._fov_output
         )
 
         # Compute omni ray directions
@@ -385,9 +444,10 @@ class NumbaRaycastObserver:
         # Trace omni rays (parallel)
         trace_all_rays_numba(
             self._origin, self._omni_directions,
-            self._world_types, self._ssize,
+            self._world_data, self._ssize,
             self._enemies, num_enemies,
             self.omni_max_dist, self.step_size, self.enemy_radius_sq,
+            self.sky_texture,
             self._omni_output
         )
 

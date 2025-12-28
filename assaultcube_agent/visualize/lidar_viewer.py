@@ -33,31 +33,45 @@ except ImportError:
     PYGAME_AVAILABLE = False
     print("pygame not installed. Install with: pip install pygame")
 
+# Import EnemyDetector for standalone test
+try:
+    from ..raycast.enemy_detector import EnemyDetector
+    ENEMY_DETECTOR_AVAILABLE = True
+except ImportError:
+    ENEMY_DETECTOR_AVAILABLE = False
+
 
 # =============================================================================
 # NUMBA-ACCELERATED RADAR RENDERING
 # =============================================================================
 
 @njit(cache=True)
-def _get_color_for_ray(distance: float, hit_type: float, max_dist: float) -> tuple:
-    """Get RGB color for a ray (numba-compiled)."""
-    depth = min(1.0, distance / max_dist)
-    inv_depth = 1.0 - depth
+def _get_color_for_ray(norm_distance: float, hit_type: float, max_dist: float) -> tuple:
+    """Get RGB color for a ray (numba-compiled).
+
+    Args:
+        norm_distance: Already normalized distance (0-1) from raycast
+        hit_type: Normalized hit type (0=nothing, 0.33=wall, 0.67=enemy, 1.0=sky)
+        max_dist: Unused, kept for API compatibility
+    """
+    # Distance is already normalized 0-1, don't divide again!
+    depth = min(1.0, max(0.0, norm_distance))
+    inv_depth = 1.0 - depth  # Closer = higher value = brighter
 
     if hit_type > 0.9:  # Sky
-        base = 80
-        intensity = int(base + inv_depth * 120)
-        return (intensity // 2, intensity // 2 + 20, min(255, intensity + 40))
+        base = 60
+        intensity = int(base + inv_depth * 140)
+        return (intensity // 2, intensity // 2 + 30, min(255, intensity + 60))
     elif hit_type > 0.6:  # Enemy
-        base = 80
-        intensity = int(base + inv_depth * 175)
-        return (min(255, intensity), 25, 25)
+        base = 100
+        intensity = int(base + inv_depth * 155)
+        return (min(255, intensity), 30, 30)
     elif hit_type > 0.25:  # Wall
-        base = 25
+        base = 30
         intensity = int(base + inv_depth * 200)
-        return (intensity, intensity, min(255, intensity + 5))
-    else:  # Nothing
-        return (15, 15, 20)
+        return (intensity, intensity, min(255, intensity + 10))
+    else:  # Nothing (max distance, no hit)
+        return (20, 20, 25)
 
 
 @njit(cache=True)
@@ -104,9 +118,8 @@ def _draw_line_to_array(
 @njit(parallel=True, cache=True)
 def _render_radar_fast(
     pixels: np.ndarray,
-    rays: np.ndarray,
-    h_rays: int,
-    v_layers: int,
+    omni_rays: np.ndarray,
+    num_omni_rays: int,
     center_x: int,
     center_y: int,
     max_radius: int,
@@ -116,37 +129,41 @@ def _render_radar_fast(
     """
     Render radar view to pixel array using parallel numba (GPU-like speed).
 
+    Uses 360° omni rays (separate from FOV rays).
+    Ray 0 = forward (0° offset from player yaw) = UP on screen
+    Ray N = N * (360/num_rays)° clockwise from forward
+
     This replaces thousands of pygame.draw.line() calls with direct pixel manipulation.
     """
-    middle_layer = v_layers // 2
-    layer_start = middle_layer * h_rays
+    # Draw all omni rays in parallel
+    for i in prange(num_omni_rays):
+        # Ray angle offset from forward (player yaw)
+        # Ray 0 = 0° (forward), ray 9 = 90° (right), etc.
+        angle_offset_deg = i * (360.0 / num_omni_rays)
 
-    # Draw all rays in parallel
-    for i in prange(h_rays):
-        ray_idx = layer_start + i
+        # Convert to screen angle:
+        # Forward (0°) should be UP (-90° in screen coords)
+        # Right (90°) should be RIGHT (0° in screen coords)
+        screen_angle_rad = (angle_offset_deg - 90.0) * 0.017453292519943295
 
-        # Angle calculation
-        angle_deg = (i / h_rays) * 360.0
-        angle_rad = (angle_deg - 90.0) * 0.017453292519943295  # deg to rad
+        distance = omni_rays[i, 0]
+        hit_type = omni_rays[i, 1]
 
-        distance = rays[ray_idx, 0]
-        hit_type = rays[ray_idx, 1]
+        # Calculate end point (distance is already normalized 0-1 from raycast)
+        ray_length = distance * max_radius
+        end_x = int(center_x + math.cos(screen_angle_rad) * ray_length)
+        end_y = int(center_y + math.sin(screen_angle_rad) * ray_length)
 
-        # Calculate end point
-        norm_dist = min(1.0, distance / max_dist)
-        ray_length = norm_dist * max_radius
-        end_x = int(center_x + math.cos(angle_rad) * ray_length)
-        end_y = int(center_y + math.sin(angle_rad) * ray_length)
-
-        # Get color
-        r, g, b = _get_color_for_ray(distance, hit_type, max_dist)
+        # Get color - unnormalize distance for color calc
+        actual_dist = distance * max_dist
+        r, g, b = _get_color_for_ray(actual_dist, hit_type, max_dist)
 
         # Determine line thickness based on hit type
-        thickness = 1
+        thickness = 2
         if hit_type > 0.9:  # Sky
             thickness = 2
         elif hit_type > 0.6:  # Enemy
-            thickness = 3
+            thickness = 4
 
         # Draw line to pixel array
         _draw_line_to_array(pixels, center_x, center_y, end_x, end_y, r, g, b, thickness)
@@ -164,28 +181,32 @@ def _render_fov_fast(
     half_fov_rays: int,
     max_dist: float,
 ):
-    """Render FOV viewport to pixel array using parallel numba."""
-    total_fov_cols = half_fov_rays * 2 + 1
-    cell_width = vp_width / total_fov_cols
+    """Render FOV viewport to pixel array using parallel numba.
+
+    Rays are now FOV-focused (packed within FOV, matching numba_raycast layout):
+    - All h_rays are within the horizontal FOV
+    - All v_layers are within the vertical FOV
+    - Ray order: left-to-right for each row, top-to-bottom rows
+    """
+    cell_width = vp_width / h_rays
     cell_height = vp_height / v_layers
 
     # Process each layer in parallel
     for layer in prange(v_layers):
         layer_start = layer * h_rays
-        screen_row = v_layers - 1 - layer
+        # Layer 0 = top of FOV (highest pitch), render at top of viewport
+        screen_row = layer
         y_start = int(vp_y + screen_row * cell_height)
         y_end = int(vp_y + (screen_row + 1) * cell_height)
 
-        col = 0
-
-        # Left side of FOV
-        for i in range(h_rays - half_fov_rays, h_rays):
-            ray_idx = layer_start + i
+        # All rays in this layer are within FOV, render left-to-right
+        for h in range(h_rays):
+            ray_idx = layer_start + h
             distance = rays[ray_idx, 0]
             hit_type = rays[ray_idx, 1]
 
-            x_start = int(vp_x + col * cell_width)
-            x_end = int(vp_x + (col + 1) * cell_width)
+            x_start = int(vp_x + h * cell_width)
+            x_end = int(vp_x + (h + 1) * cell_width)
             r, g, b = _get_color_for_ray(distance, hit_type, max_dist)
 
             for py in range(y_start, min(y_end + 1, pixels.shape[0])):
@@ -194,25 +215,6 @@ def _render_fov_fast(
                         pixels[py, px, 0] = r
                         pixels[py, px, 1] = g
                         pixels[py, px, 2] = b
-            col += 1
-
-        # Right side of FOV
-        for i in range(half_fov_rays + 1):
-            ray_idx = layer_start + i
-            distance = rays[ray_idx, 0]
-            hit_type = rays[ray_idx, 1]
-
-            x_start = int(vp_x + col * cell_width)
-            x_end = int(vp_x + (col + 1) * cell_width)
-            r, g, b = _get_color_for_ray(distance, hit_type, max_dist)
-
-            for py in range(y_start, min(y_end + 1, pixels.shape[0])):
-                for px in range(x_start, min(x_end + 1, pixels.shape[1])):
-                    if 0 <= px < pixels.shape[1] and 0 <= py < pixels.shape[0]:
-                        pixels[py, px, 0] = r
-                        pixels[py, px, 1] = g
-                        pixels[py, px, 2] = b
-            col += 1
 
 
 # View modes
@@ -250,26 +252,33 @@ class DepthViewer:
         self,
         width: int = 800,
         height: int = 600,
-        # Match numba_raycast.py FOV config
+        # FOV config (for viewport)
         horizontal_rays: int = 41,      # Match fov_rays_h
         vertical_layers: int = 17,      # Match fov_rays_v
         fov_degrees: float = 120.0,     # Match fov_h
         max_distance: float = 350.0,    # Match fov_max_dist
+        # Omni config (for radar) - 360° coverage
+        omni_rays: int = 72,            # 5° per ray over 360°
+        omni_max_dist: float = 150.0,   # Radar max distance
     ):
         if not PYGAME_AVAILABLE:
             raise ImportError("pygame required for visualization")
 
         self.width = width
         self.height = height
+        # FOV (viewport)
         self.h_rays = horizontal_rays
         self.v_layers = vertical_layers
         self.fov_degrees = fov_degrees
         self.max_dist = max_distance
-        self.total_rays = horizontal_rays * vertical_layers
+        self.total_fov_rays = horizontal_rays * vertical_layers
+        # Omni (radar)
+        self.omni_rays = omni_rays
+        self.omni_max_dist = omni_max_dist
 
-        # Calculate FOV ray indices
-        rays_per_degree = horizontal_rays / 360.0
-        self.fov_rays = int(fov_degrees * rays_per_degree)
+        # Legacy compat
+        self.total_rays = self.total_fov_rays
+        self.fov_rays = horizontal_rays  # All h_rays are within FOV now
         self.half_fov_rays = self.fov_rays // 2
 
         # View mode (toggle with V key)
@@ -305,44 +314,44 @@ class DepthViewer:
 
         # Warm up numba JIT compilation
         print("[DepthViewer] Warming up Numba JIT...")
-        dummy_rays = np.zeros((self.total_rays, 2), dtype=np.float64)
+        dummy_omni = np.zeros((self.omni_rays, 2), dtype=np.float64)
         _render_radar_fast(
-            self._pixel_buffer, dummy_rays,
-            self.h_rays, self.v_layers,
+            self._pixel_buffer, dummy_omni,
+            self.omni_rays,
             self.width // 2, self.height // 2,
             min(self.width, self.height) // 2 - 80,
-            self.max_dist, self.fov_degrees
+            self.omni_max_dist, self.fov_degrees
         )
         print("[DepthViewer] JIT ready!")
 
-    def _get_depth_color(self, distance: float, hit_type: float) -> tuple:
+    def _get_depth_color(self, norm_distance: float, hit_type: float) -> tuple:
         """
         Get color based on distance and hit type.
 
-        Distance is in raw world units (0 to max_dist).
+        Distance is already normalized (0-1) from raycast output.
         Hit type is normalized: 0=nothing, 0.33=wall, 0.67=enemy, 1.0=sky
         """
-        # Normalize distance for coloring (0 = close, 1 = far)
-        depth = min(1.0, distance / self.max_dist)
-        inv_depth = 1.0 - depth  # Closer = higher value
+        # Distance is already normalized 0-1, don't divide again!
+        depth = min(1.0, max(0.0, norm_distance))
+        inv_depth = 1.0 - depth  # Closer = higher value = brighter
 
         if hit_type > 0.9:  # Sky (HIT_SKY = 3, normalized to 1.0)
             # Blue sky gradient - lighter when closer (atmosphere effect)
-            base = 80
-            intensity = int(base + inv_depth * 120)
-            return (intensity // 2, intensity // 2 + 20, intensity + 40)
+            base = 60
+            intensity = int(base + inv_depth * 140)
+            return (intensity // 2, intensity // 2 + 30, min(255, intensity + 60))
 
         elif hit_type > 0.6:  # Enemy (HIT_ENEMY = 2, normalized to 0.67)
             # Red - brighter when closer
-            base = 80
-            intensity = int(base + inv_depth * 175)
-            return (intensity, 25, 25)
+            base = 100
+            intensity = int(base + inv_depth * 155)
+            return (min(255, intensity), 30, 30)
 
         elif hit_type > 0.25:  # Wall (HIT_WALL = 1, normalized to 0.33)
             # Gray gradient - brighter when closer = more detail
-            base = 25
+            base = 30
             intensity = int(base + inv_depth * 200)
-            return (intensity, intensity, intensity + 5)
+            return (intensity, intensity, min(255, intensity + 10))
 
         else:  # Nothing (HIT_NOTHING = 0)
             # Dark void - no depth info
@@ -397,14 +406,14 @@ class DepthViewer:
         pygame.draw.line(self.screen, COLOR_CROSSHAIR,
                         (cx, cy - crosshair_size), (cx, cy + crosshair_size), 2)
 
-    def draw_radar(self, rays: np.ndarray, enemies: list = None):
+    def draw_radar(self, omni_rays: np.ndarray, enemies: list = None):
         """
-        Draw top-down radar view showing all 360° rays.
+        Draw top-down radar view showing all 360° omni rays.
 
-        Uses Numba-accelerated pixel rendering for high ray counts.
+        Uses Numba-accelerated pixel rendering.
 
         Args:
-            rays: Ray data from OmniRaycast
+            omni_rays: Omni ray data (36 rays over 360°) from NumbaRaycast
             enemies: Optional list of enemy info dicts with 'angle_h' and 'distance' keys
                      (from EnemyDetector, shows enemies even if rays are blocked)
         """
@@ -420,13 +429,13 @@ class DepthViewer:
         self._pixel_buffer[:, :, 1] = COLOR_BG[1]
         self._pixel_buffer[:, :, 2] = COLOR_BG[2]
 
-        # Fast Numba rendering of all rays to pixel buffer
-        rays_f64 = rays.astype(np.float64) if rays.dtype != np.float64 else rays
+        # Fast Numba rendering of omni rays to pixel buffer
+        rays_f64 = omni_rays.astype(np.float64) if omni_rays.dtype != np.float64 else omni_rays
         _render_radar_fast(
             self._pixel_buffer, rays_f64,
-            self.h_rays, self.v_layers,
+            self.omni_rays,
             center_x, center_y, max_radius,
-            self.max_dist, self.fov_degrees
+            self.omni_max_dist, self.fov_degrees
         )
 
         # Blit pixel buffer to screen using surfarray
@@ -438,16 +447,17 @@ class DepthViewer:
         for r in range(50, max_radius, 50):
             pygame.draw.circle(self.screen, COLOR_GRID, (center_x, center_y), r, 1)
 
-        # FOV indicator lines
+        # FOV indicator lines (shows the forward FOV cone)
         half_fov = self.fov_degrees / 2
         for angle in [-half_fov, half_fov]:
+            # angle is offset from forward, screen -90° = forward/up
             rad = math.radians(angle - 90)
             end_x = int(center_x + math.cos(rad) * max_radius)
             end_y = int(center_y + math.sin(rad) * max_radius)
             pygame.draw.line(self.screen, COLOR_FOV_LINE,
                            (center_x, center_y), (end_x, end_y), 1)
 
-        # Draw player at center
+        # Draw player at center (triangle pointing UP = forward)
         pygame.draw.circle(self.screen, COLOR_PLAYER, (center_x, center_y), 6)
         pygame.draw.line(self.screen, COLOR_PLAYER,
                         (center_x, center_y), (center_x, center_y - 15), 2)
@@ -459,8 +469,10 @@ class DepthViewer:
                 dist = enemy.get('distance', 0)
                 has_los = enemy.get('has_los', True)
 
+                # angle_h is relative to player view (0 = directly ahead)
+                # Screen: -90° = up = forward
                 angle_rad = math.radians(angle_h - 90)
-                norm_dist = min(1.0, dist / self.max_dist)
+                norm_dist = min(1.0, dist / self.omni_max_dist)
                 enemy_radius = norm_dist * max_radius
 
                 enemy_x = int(center_x + math.cos(angle_rad) * enemy_radius)
@@ -490,12 +502,18 @@ class DepthViewer:
         fps_text = self.font.render(f"FPS: {self.fps:.0f}", True, COLOR_TEXT)
         self.screen.blit(fps_text, (10, 35))
 
-        # Ray info - show total rays and resolution
-        deg_per_ray = 360.0 / self.h_rays
-        ray_text = self.font.render(
-            f"Rays: {self.h_rays}×{self.v_layers}={self.total_rays} ({deg_per_ray:.1f}°/ray)",
-            True, COLOR_TEXT
-        )
+        # Ray info - show FOV and omni ray counts
+        if self.view_mode == VIEW_RADAR:
+            deg_per_ray = 360.0 / self.omni_rays
+            ray_text = self.font.render(
+                f"Omni: {self.omni_rays} rays (360°, {deg_per_ray:.0f}°/ray)",
+                True, COLOR_TEXT
+            )
+        else:
+            ray_text = self.font.render(
+                f"FOV: {self.h_rays}×{self.v_layers}={self.total_fov_rays} rays ({self.fov_degrees}°×{80}°)",
+                True, COLOR_TEXT
+            )
         self.screen.blit(ray_text, (100, 35))
 
         # Player stats (bottom bar)
@@ -529,15 +547,17 @@ class DepthViewer:
             self.screen.blit(text, (x + 16, legend_y - 1))
             x += 80
 
-    def update(self, rays: np.ndarray, player_state: Optional[dict] = None, enemies: list = None):
+    def update(self, fov_rays: np.ndarray, player_state: Optional[dict] = None,
+               enemies: list = None, omni_rays: np.ndarray = None):
         """
         Update the visualization with new ray data.
 
         Args:
-            rays: Shape (total_rays, 2) - [raw_distance, hit_type]
+            fov_rays: Shape (total_fov, 2) - FOV rays for viewport [distance, hit_type]
             player_state: Optional dict with health, frags, damage, enemies, etc.
             enemies: Optional list of enemy dicts with 'angle_h', 'distance', 'has_los'
                      (from EnemyDetector - shows on radar even if rays blocked)
+            omni_rays: Shape (omni_rays, 2) - 360° rays for radar [distance, hit_type]
         """
         if not self.running:
             return False
@@ -559,14 +579,18 @@ class DepthViewer:
         if enemies is None and player_state:
             enemies = player_state.get('enemies', None)
 
+        # Use omni_rays for radar if provided, otherwise fall back to fov_rays
+        # (This handles backwards compat and standalone vs aim_trainer usage)
+        radar_rays = omni_rays if omni_rays is not None else fov_rays
+
         # Clear screen
         self.screen.fill(COLOR_BG)
 
         # Draw based on view mode
         if self.view_mode == VIEW_RADAR:
-            self.draw_radar(rays, enemies)
+            self.draw_radar(radar_rays, enemies)
         else:
-            self.draw_fov_viewport(rays)
+            self.draw_fov_viewport(fov_rays)
         self.draw_stats(player_state)
 
         # Update display
@@ -592,10 +616,12 @@ class DepthViewer:
 def run_viewer_process(
     ray_queue: mp.Queue,
     state_queue: mp.Queue,
+    omni_queue: mp.Queue,
     h_rays: int,
     v_layers: int,
     fov_degrees: float,
     max_dist: float,
+    omni_rays_count: int = 72,
 ):
     """
     Run the viewer in a separate process.
@@ -605,10 +631,12 @@ def run_viewer_process(
         vertical_layers=v_layers,
         fov_degrees=fov_degrees,
         max_distance=max_dist,
+        omni_rays=omni_rays_count,
     )
     viewer.init_display()
 
     last_rays = np.zeros((h_rays * v_layers, 2), dtype=np.float32)
+    last_omni = np.zeros((omni_rays_count, 2), dtype=np.float32)
     last_state = {}
 
     while viewer.running:
@@ -620,12 +648,18 @@ def run_viewer_process(
             pass
 
         try:
+            while not omni_queue.empty():
+                last_omni = omni_queue.get_nowait()
+        except:
+            pass
+
+        try:
             while not state_queue.empty():
                 last_state = state_queue.get_nowait()
         except:
             pass
 
-        if not viewer.update(last_rays, last_state):
+        if not viewer.update(last_rays, last_state, omni_rays=last_omni):
             break
 
     viewer.close()
@@ -657,13 +691,16 @@ class LidarVisualizer:
         v_layers: int = 17,
         fov_degrees: float = 120.0,
         max_dist: float = 350.0,
+        omni_rays: int = 72,
     ):
         self.h_rays = h_rays
         self.v_layers = v_layers
         self.fov_degrees = fov_degrees
         self.max_dist = max_dist
+        self.omni_rays = omni_rays
         self.ray_queue: Optional[mp.Queue] = None
         self.state_queue: Optional[mp.Queue] = None
+        self.omni_queue: Optional[mp.Queue] = None
         self.process: Optional[mp.Process] = None
         self.running = False
 
@@ -674,33 +711,42 @@ class LidarVisualizer:
 
         self.ray_queue = mp.Queue(maxsize=2)
         self.state_queue = mp.Queue(maxsize=2)
+        self.omni_queue = mp.Queue(maxsize=2)
 
         self.process = mp.Process(
             target=run_viewer_process,
             args=(
                 self.ray_queue,
                 self.state_queue,
+                self.omni_queue,
                 self.h_rays,
                 self.v_layers,
                 self.fov_degrees,
                 self.max_dist,
+                self.omni_rays,
             ),
             daemon=True
         )
         self.process.start()
         self.running = True
-        print(f"[DepthViz] Started (FOV: {self.fov_degrees}°, max_dist: {self.max_dist})")
+        print(f"[DepthViz] Started (FOV: {self.fov_degrees}°, omni_rays: {self.omni_rays})")
 
-    def update(self, rays: np.ndarray, player_state: Optional[dict] = None):
+    def update(self, rays: np.ndarray, player_state: Optional[dict] = None,
+               omni_rays: np.ndarray = None):
         """
         Send new data to the visualization.
 
         Non-blocking - if the queue is full, drops the update.
+
+        Args:
+            rays: FOV rays for viewport
+            player_state: dict with health, frags, damage, enemies
+            omni_rays: 360° rays for radar
         """
         if not self.running:
             return
 
-        # Send rays (drop if queue full)
+        # Send FOV rays (drop if queue full)
         try:
             if self.ray_queue.full():
                 try:
@@ -710,6 +756,18 @@ class LidarVisualizer:
             self.ray_queue.put_nowait(rays.copy())
         except:
             pass
+
+        # Send omni rays for radar
+        if omni_rays is not None and self.omni_queue:
+            try:
+                if self.omni_queue.full():
+                    try:
+                        self.omni_queue.get_nowait()
+                    except:
+                        pass
+                self.omni_queue.put_nowait(omni_rays.copy())
+            except:
+                pass
 
         # Send state
         if player_state:
@@ -741,10 +799,13 @@ class LidarVisualizer:
 def test_standalone():
     """Test the viewer with live raycast data.
 
-    Uses HIGH ray count for visualization quality (360 rays = 1° per ray).
-    This is SEPARATE from training config which uses fewer rays for efficiency.
+    Uses NumbaRaycastObserver which provides BOTH:
+    - FOV rays (41x17 = 697 rays within 120°x80° FOV) for viewport
+    - Omni rays (36 rays over 360°) for radar
+
+    Now includes EnemyDetector for proper enemy overlay on radar view.
     """
-    from ..raycast import OmniRaycastObserver
+    from ..raycast.numba_raycast import NumbaRaycastObserver
     from ..memory import ACMemoryReader
 
     print("=" * 60)
@@ -758,49 +819,76 @@ def test_standalone():
         print("Failed to attach to AssaultCube!")
         return
 
-    # HIGH ray count for visualization (1° per ray = smooth coverage)
-    # Training uses fewer rays (41) for efficiency - this is just for viewing
-    h_rays = 360       # 1° per ray - full smooth 360° coverage
-    v_layers = 17      # Vertical layers for depth
-    max_dist = 350.0
-
-    raycast = OmniRaycastObserver(
-        horizontal_rays=h_rays,
-        vertical_layers=v_layers,
-        max_distance=max_dist
+    # Use NumbaRaycastObserver which provides both FOV and omni rays
+    raycast = NumbaRaycastObserver(
+        fov_rays_h=41,      # 41 rays horizontal within FOV
+        fov_rays_v=17,      # 17 layers vertical within FOV
+        fov_h=120.0,        # 120° horizontal FOV
+        fov_v=80.0,         # 80° vertical FOV
+        fov_max_dist=350.0, # FOV max distance
+        omni_rays=72,       # 72 rays over 360° for radar (5° per ray)
+        omni_max_dist=150.0,# Radar max distance
     )
     if not raycast.attach():
         print("Failed to attach raycast observer!")
         reader.detach()
         return
 
-    # Create viewer (in main process for standalone test)
+    # Initialize EnemyDetector for radar overlay
+    detector = None
+    if ENEMY_DETECTOR_AVAILABLE:
+        detector = EnemyDetector(fov_h=120.0, fov_v=90.0, use_los=True)
+        if not detector.attach():
+            print("[!] Failed to attach enemy detector - radar overlay disabled")
+            detector = None
+        else:
+            print("[+] EnemyDetector attached - radar overlay enabled")
+
+    # Create viewer with FOV ray config for viewport
+    # Radar will use separate omni rays
     viewer = DepthViewer(
-        horizontal_rays=h_rays,
-        vertical_layers=v_layers,
+        horizontal_rays=41,   # For FOV viewport
+        vertical_layers=17,
         fov_degrees=120.0,
-        max_distance=max_dist,
+        max_distance=350.0,
+        omni_rays=72,         # For radar view (360°, 5° per ray)
+        omni_max_dist=150.0,
     )
     viewer.init_display()
 
-    print(f"[+] Running with {h_rays}×{v_layers}={h_rays*v_layers} rays (1°/ray)")
-    print("[+] Press ESC to exit")
+    print(f"[+] FOV: 41×17=697 rays (120°×80°)")
+    print(f"[+] Radar: 72 rays (360°, 5° per ray)")
+    print("[+] Press ESC to exit, V to toggle view")
 
     try:
         while viewer.running:
-            # Get raycast data
-            rays = raycast.get_observation()
+            # Get both FOV and omni rays
+            fov_rays, omni_rays = raycast.get_observation()
 
             # Get player state
             state = reader.read_state()
+
+            # Detect enemies for radar overlay
+            enemy_data = []
+            if detector:
+                enemies = detector.detect_enemies(
+                    state.position, state.yaw, state.pitch,
+                    max_distance=350.0, filter_team=True, filter_los=True
+                )
+                enemy_data = [
+                    {'angle_h': e.angle_h, 'distance': e.distance, 'has_los': e.has_los}
+                    for e in enemies
+                ]
+
             player_state = {
                 'health': state.health,
                 'frags': state.frags,
                 'damage': state.damage_dealt,
+                'enemies': enemy_data,
             }
 
-            # Update viewer
-            if not viewer.update(rays, player_state):
+            # Update viewer with both ray types
+            if not viewer.update(fov_rays, player_state, omni_rays=omni_rays):
                 break
 
     except KeyboardInterrupt:
@@ -808,6 +896,8 @@ def test_standalone():
 
     viewer.close()
     raycast.detach()
+    if detector:
+        detector.detach()
     reader.detach()
     print("[+] Done!")
 

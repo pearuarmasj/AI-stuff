@@ -13,7 +13,7 @@ import time
 from typing import Optional
 
 from ..memory import ACMemoryReader
-from ..raycast import OmniRaycastObserver
+from ..raycast.numba_raycast import NumbaRaycastObserver
 from ..raycast.enemy_detector import EnemyDetector, EnemyInfo
 from ..control import MouseController, emergency_stop, check_stop, wait_if_paused
 from ..visualize import LidarVisualizer
@@ -60,13 +60,14 @@ class AimTrainer:
         # Optional LiDAR for visualization only (NOT for enemy detection!)
         self._visualize = visualize
         self._visualizer: Optional[LidarVisualizer] = None
-        self._raycast: Optional[OmniRaycastObserver] = None
+        self._raycast: Optional[NumbaRaycastObserver] = None
 
         if visualize:
-            self._raycast = OmniRaycastObserver(
-                horizontal_rays=horizontal_rays,
-                vertical_layers=vertical_layers,
-                max_distance=max_distance,
+            self._raycast = NumbaRaycastObserver(
+                fov_rays_h=horizontal_rays,
+                fov_rays_v=vertical_layers,
+                fov_max_dist=max_distance,
+                fov_h=game_fov,
             )
             self._visualizer = LidarVisualizer(
                 h_rays=horizontal_rays,
@@ -156,18 +157,18 @@ class AimTrainer:
 
         # Update LiDAR visualization if enabled
         if self._visualizer and self._visualizer.is_running() and self._raycast:
-            rays = self._raycast.get_observation()
+            fov_rays, omni_rays = self._raycast.get_observation()
             # Convert enemies to dict format for radar overlay
             enemy_data = [
                 {'angle_h': e.angle_h, 'distance': e.distance, 'has_los': e.has_los}
                 for e in enemies
             ]
-            self._visualizer.update(rays, {
+            self._visualizer.update(fov_rays, {
                 'health': state.health,
                 'frags': state.frags,
                 'damage': state.damage_dealt,
                 'enemies': enemy_data,  # Pass enemies for radar overlay
-            })
+            }, omni_rays=omni_rays)
 
         if do_debug:
             enemy_count = len(enemies)

@@ -45,6 +45,10 @@ SEMISOLID = 5   # Mipped solid
 # In AC: 1 cube = 4 world units for floor/ceil height
 CUBE_HEIGHT = 4.0
 
+# Player body height offset - positions read from memory are at foot level,
+# but we want to check collision at body center for proper detection
+PLAYER_BODY_CENTER_OFFSET = 4.0  # Half player height (~8 units total)
+
 # Hit types
 HIT_NOTHING = 0
 HIT_WALL = 1
@@ -177,13 +181,15 @@ def compute_directions(
 
 class OmniRaycastObserver:
     """
-    Full 360° omnidirectional raycasting.
+    FOV-focused raycasting matching numba_raycast.py configuration.
 
-    Default configuration (matches numba_raycast.py FOV config):
-        - 41 horizontal rays (full 360°)
-        - 17 vertical layers (-40° to +40°, 80° vertical span)
+    Default configuration (matches numba_raycast.py):
+        - 41 horizontal rays within 120° FOV
+        - 17 vertical layers within 80° vertical span
         - Total: 697 rays (matches fov_rays_h × fov_rays_v)
         - Max distance: 350 units
+
+    Rays are densely packed within the FOV for proper depth visualization.
 
     The observation is organized as:
         [v_layer_0 (41 rays), v_layer_1 (41 rays), ..., v_layer_16 (41 rays)]
@@ -198,16 +204,16 @@ class OmniRaycastObserver:
         # Match numba_raycast.py FOV config for consistency
         horizontal_rays: int = 41,      # Match fov_rays_h
         vertical_layers: int = 17,      # Match fov_rays_v
-        vertical_min: float = -40.0,    # 80° vertical span (match fov_v)
-        vertical_max: float = 40.0,
+        fov_h: float = 120.0,           # Horizontal FOV in degrees
+        fov_v: float = 80.0,            # Vertical FOV in degrees
         max_distance: float = 350.0,    # Match fov_max_dist
         step_size: float = 0.5,         # Small enough to not skip 1-unit walls
-        enemy_hitbox_radius: float = 4.0,
+        enemy_hitbox_radius: float = 5.0,  # Increased from 4.0 for reliable body detection
     ):
         self.h_rays = horizontal_rays
         self.v_layers = vertical_layers
-        self.v_min = vertical_min
-        self.v_max = vertical_max
+        self.fov_h = fov_h
+        self.fov_v = fov_v
         self.max_dist = max_distance
         self.step_size = step_size
         self.enemy_radius_sq = enemy_hitbox_radius ** 2
@@ -233,22 +239,23 @@ class OmniRaycastObserver:
         self._enemies = np.zeros((32, 3), dtype=np.float64)
 
     def _compute_ray_angles(self) -> np.ndarray:
-        """Compute all ray angle offsets (yaw_offset, pitch)."""
+        """Compute all ray angle offsets (yaw_offset, pitch_offset).
+
+        Rays are packed within the FOV (matching numba_raycast.py layout):
+        - Horizontal: -fov_h/2 to +fov_h/2
+        - Vertical: +fov_v/2 to -fov_v/2 (top to bottom)
+        """
         angles = []
+        half_h = self.fov_h / 2
+        half_v = self.fov_v / 2
 
-        # Vertical layers
-        if self.v_layers > 1:
-            pitches = np.linspace(self.v_min, self.v_max, self.v_layers)
-        else:
-            pitches = [0.0]
-
-        # Horizontal rays (full 360°)
-        yaw_step = 360.0 / self.h_rays
-
-        for pitch in pitches:
+        for v in range(self.v_layers):
+            # Pitch: top (+half_v) to bottom (-half_v)
+            pitch_off = half_v - (v / max(self.v_layers - 1, 1)) * self.fov_v
             for h in range(self.h_rays):
-                yaw_offset = h * yaw_step  # 0° to 360°
-                angles.append((yaw_offset, pitch))
+                # Yaw: left (-half_h) to right (+half_h)
+                yaw_off = -half_h + (h / max(self.h_rays - 1, 1)) * self.fov_h
+                angles.append((yaw_off, pitch_off))
 
         return np.array(angles, dtype=np.float64)
 
@@ -265,9 +272,9 @@ class OmniRaycastObserver:
             self._attached = True
 
             print(f"[OmniRaycast] Attached!")
-            print(f"[OmniRaycast] Horizontal: {self.h_rays} rays (every {360/self.h_rays:.1f}°)")
-            print(f"[OmniRaycast] Vertical: {self.v_layers} layers ({self.v_min}° to {self.v_max}°)")
-            print(f"[OmniRaycast] Total: {self.total_rays} rays (full 360° coverage)")
+            print(f"[OmniRaycast] Horizontal: {self.h_rays} rays within {self.fov_h}° FOV")
+            print(f"[OmniRaycast] Vertical: {self.v_layers} layers within {self.fov_v}° FOV")
+            print(f"[OmniRaycast] Total: {self.total_rays} rays (FOV-focused, matching numba_raycast)")
             print(f"[OmniRaycast] World: {self._ssize}x{self._ssize}")
 
             # Debug ceiling textures
@@ -342,7 +349,12 @@ class OmniRaycastObserver:
             return (0, 0, 0), 0, 0, 0
 
     def _read_enemies(self, own_team: int) -> int:
-        """Read enemy positions. Returns count."""
+        """Read enemy positions. Returns count.
+
+        Note: Enemy Z position is offset by PLAYER_BODY_CENTER_OFFSET to check
+        collision at body center rather than feet. This ensures rays at chest/head
+        height properly detect enemies.
+        """
         count = 0
         try:
             player1_ptr = self.pm.read_int(self.module_base + PLAYER1_PTR_OFFSET)
@@ -360,7 +372,8 @@ class OmniRaycastObserver:
 
                 self._enemies[count, 0] = self.pm.read_float(ptr + POS_X)
                 self._enemies[count, 1] = self.pm.read_float(ptr + POS_Y)
-                self._enemies[count, 2] = self.pm.read_float(ptr + POS_Z)
+                # Add offset to check at body center, not feet
+                self._enemies[count, 2] = self.pm.read_float(ptr + POS_Z) + PLAYER_BODY_CENTER_OFFSET
                 count += 1
                 if count >= 32:
                     break
@@ -380,6 +393,8 @@ class OmniRaycastObserver:
 
         pos, yaw, pitch, own_team = self._read_player()
         self._origin[0], self._origin[1], self._origin[2] = pos
+        # Offset Z to eye level (same as enemy body center offset)
+        self._origin[2] += PLAYER_BODY_CENTER_OFFSET
 
         num_enemies = self._read_enemies(own_team)
 
