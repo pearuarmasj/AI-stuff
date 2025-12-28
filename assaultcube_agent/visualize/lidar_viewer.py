@@ -23,13 +23,196 @@ import multiprocessing as mp
 from typing import Optional
 
 import numpy as np
+from numba import njit, prange
 
 try:
     import pygame
+    import pygame.surfarray
     PYGAME_AVAILABLE = True
 except ImportError:
     PYGAME_AVAILABLE = False
     print("pygame not installed. Install with: pip install pygame")
+
+
+# =============================================================================
+# NUMBA-ACCELERATED RADAR RENDERING
+# =============================================================================
+
+@njit(cache=True)
+def _get_color_for_ray(distance: float, hit_type: float, max_dist: float) -> tuple:
+    """Get RGB color for a ray (numba-compiled)."""
+    depth = min(1.0, distance / max_dist)
+    inv_depth = 1.0 - depth
+
+    if hit_type > 0.9:  # Sky
+        base = 80
+        intensity = int(base + inv_depth * 120)
+        return (intensity // 2, intensity // 2 + 20, min(255, intensity + 40))
+    elif hit_type > 0.6:  # Enemy
+        base = 80
+        intensity = int(base + inv_depth * 175)
+        return (min(255, intensity), 25, 25)
+    elif hit_type > 0.25:  # Wall
+        base = 25
+        intensity = int(base + inv_depth * 200)
+        return (intensity, intensity, min(255, intensity + 5))
+    else:  # Nothing
+        return (15, 15, 20)
+
+
+@njit(cache=True)
+def _draw_line_to_array(
+    pixels: np.ndarray,
+    cx: int, cy: int,
+    end_x: int, end_y: int,
+    r: int, g: int, b: int,
+    thickness: int = 1
+):
+    """Draw a line on pixel array using Bresenham's algorithm (numba-compiled)."""
+    height, width = pixels.shape[0], pixels.shape[1]
+
+    dx = abs(end_x - cx)
+    dy = abs(end_y - cy)
+    sx = 1 if cx < end_x else -1
+    sy = 1 if cy < end_y else -1
+    err = dx - dy
+
+    x, y = cx, cy
+
+    while True:
+        # Draw pixel with thickness
+        for tx in range(-thickness//2, thickness//2 + 1):
+            for ty in range(-thickness//2, thickness//2 + 1):
+                px, py = x + tx, y + ty
+                if 0 <= px < width and 0 <= py < height:
+                    pixels[py, px, 0] = r
+                    pixels[py, px, 1] = g
+                    pixels[py, px, 2] = b
+
+        if x == end_x and y == end_y:
+            break
+
+        e2 = 2 * err
+        if e2 > -dy:
+            err -= dy
+            x += sx
+        if e2 < dx:
+            err += dx
+            y += sy
+
+
+@njit(parallel=True, cache=True)
+def _render_radar_fast(
+    pixels: np.ndarray,
+    rays: np.ndarray,
+    h_rays: int,
+    v_layers: int,
+    center_x: int,
+    center_y: int,
+    max_radius: int,
+    max_dist: float,
+    fov_degrees: float,
+):
+    """
+    Render radar view to pixel array using parallel numba (GPU-like speed).
+
+    This replaces thousands of pygame.draw.line() calls with direct pixel manipulation.
+    """
+    middle_layer = v_layers // 2
+    layer_start = middle_layer * h_rays
+
+    # Draw all rays in parallel
+    for i in prange(h_rays):
+        ray_idx = layer_start + i
+
+        # Angle calculation
+        angle_deg = (i / h_rays) * 360.0
+        angle_rad = (angle_deg - 90.0) * 0.017453292519943295  # deg to rad
+
+        distance = rays[ray_idx, 0]
+        hit_type = rays[ray_idx, 1]
+
+        # Calculate end point
+        norm_dist = min(1.0, distance / max_dist)
+        ray_length = norm_dist * max_radius
+        end_x = int(center_x + math.cos(angle_rad) * ray_length)
+        end_y = int(center_y + math.sin(angle_rad) * ray_length)
+
+        # Get color
+        r, g, b = _get_color_for_ray(distance, hit_type, max_dist)
+
+        # Determine line thickness based on hit type
+        thickness = 1
+        if hit_type > 0.9:  # Sky
+            thickness = 2
+        elif hit_type > 0.6:  # Enemy
+            thickness = 3
+
+        # Draw line to pixel array
+        _draw_line_to_array(pixels, center_x, center_y, end_x, end_y, r, g, b, thickness)
+
+
+@njit(parallel=True, cache=True)
+def _render_fov_fast(
+    pixels: np.ndarray,
+    rays: np.ndarray,
+    h_rays: int,
+    v_layers: int,
+    vp_x: int, vp_y: int,
+    vp_width: int, vp_height: int,
+    fov_rays: int,
+    half_fov_rays: int,
+    max_dist: float,
+):
+    """Render FOV viewport to pixel array using parallel numba."""
+    total_fov_cols = half_fov_rays * 2 + 1
+    cell_width = vp_width / total_fov_cols
+    cell_height = vp_height / v_layers
+
+    # Process each layer in parallel
+    for layer in prange(v_layers):
+        layer_start = layer * h_rays
+        screen_row = v_layers - 1 - layer
+        y_start = int(vp_y + screen_row * cell_height)
+        y_end = int(vp_y + (screen_row + 1) * cell_height)
+
+        col = 0
+
+        # Left side of FOV
+        for i in range(h_rays - half_fov_rays, h_rays):
+            ray_idx = layer_start + i
+            distance = rays[ray_idx, 0]
+            hit_type = rays[ray_idx, 1]
+
+            x_start = int(vp_x + col * cell_width)
+            x_end = int(vp_x + (col + 1) * cell_width)
+            r, g, b = _get_color_for_ray(distance, hit_type, max_dist)
+
+            for py in range(y_start, min(y_end + 1, pixels.shape[0])):
+                for px in range(x_start, min(x_end + 1, pixels.shape[1])):
+                    if 0 <= px < pixels.shape[1] and 0 <= py < pixels.shape[0]:
+                        pixels[py, px, 0] = r
+                        pixels[py, px, 1] = g
+                        pixels[py, px, 2] = b
+            col += 1
+
+        # Right side of FOV
+        for i in range(half_fov_rays + 1):
+            ray_idx = layer_start + i
+            distance = rays[ray_idx, 0]
+            hit_type = rays[ray_idx, 1]
+
+            x_start = int(vp_x + col * cell_width)
+            x_end = int(vp_x + (col + 1) * cell_width)
+            r, g, b = _get_color_for_ray(distance, hit_type, max_dist)
+
+            for py in range(y_start, min(y_end + 1, pixels.shape[0])):
+                for px in range(x_start, min(x_end + 1, pixels.shape[1])):
+                    if 0 <= px < pixels.shape[1] and 0 <= py < pixels.shape[0]:
+                        pixels[py, px, 0] = r
+                        pixels[py, px, 1] = g
+                        pixels[py, px, 2] = b
+            col += 1
 
 
 # View modes
@@ -67,10 +250,11 @@ class DepthViewer:
         self,
         width: int = 800,
         height: int = 600,
-        horizontal_rays: int = 72,
-        vertical_layers: int = 9,
-        fov_degrees: float = 120.0,
-        max_distance: float = 250.0,
+        # Match numba_raycast.py FOV config
+        horizontal_rays: int = 41,      # Match fov_rays_h
+        vertical_layers: int = 17,      # Match fov_rays_v
+        fov_degrees: float = 120.0,     # Match fov_h
+        max_distance: float = 350.0,    # Match fov_max_dist
     ):
         if not PYGAME_AVAILABLE:
             raise ImportError("pygame required for visualization")
@@ -115,6 +299,22 @@ class DepthViewer:
         self.clock = pygame.time.Clock()
         self.running = True
 
+        # Pre-allocate pixel buffer for fast rendering
+        self._pixel_buffer = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+        self._render_surface = pygame.Surface((self.width, self.height))
+
+        # Warm up numba JIT compilation
+        print("[DepthViewer] Warming up Numba JIT...")
+        dummy_rays = np.zeros((self.total_rays, 2), dtype=np.float64)
+        _render_radar_fast(
+            self._pixel_buffer, dummy_rays,
+            self.h_rays, self.v_layers,
+            self.width // 2, self.height // 2,
+            min(self.width, self.height) // 2 - 80,
+            self.max_dist, self.fov_degrees
+        )
+        print("[DepthViewer] JIT ready!")
+
     def _get_depth_color(self, distance: float, hit_type: float) -> tuple:
         """
         Get color based on distance and hit type.
@@ -152,6 +352,7 @@ class DepthViewer:
         """
         Draw full-screen FOV viewport with depth coloring.
 
+        Uses Numba-accelerated pixel rendering for high ray counts.
         Only displays rays within the configured FOV.
         """
         # Viewport layout - full screen with margins
@@ -164,47 +365,28 @@ class DepthViewer:
         vp_width = self.width - (margin_sides * 2)
         vp_height = self.height - margin_top - margin_bottom
 
+        # Clear pixel buffer to background color
+        self._pixel_buffer[:, :, 0] = COLOR_BG[0]
+        self._pixel_buffer[:, :, 1] = COLOR_BG[1]
+        self._pixel_buffer[:, :, 2] = COLOR_BG[2]
+
+        # Fast Numba rendering of FOV rays to pixel buffer
+        rays_f64 = rays.astype(np.float64) if rays.dtype != np.float64 else rays
+        _render_fov_fast(
+            self._pixel_buffer, rays_f64,
+            self.h_rays, self.v_layers,
+            vp_x, vp_y, vp_width, vp_height,
+            self.fov_rays, self.half_fov_rays,
+            self.max_dist
+        )
+
+        # Blit pixel buffer to screen using surfarray
+        pygame.surfarray.blit_array(self._render_surface, self._pixel_buffer.swapaxes(0, 1))
+        self.screen.blit(self._render_surface, (0, 0))
+
         # Draw border
         pygame.draw.rect(self.screen, COLOR_BORDER,
                         (vp_x - 2, vp_y - 2, vp_width + 4, vp_height + 4), 2)
-
-        # Calculate cell sizes
-        total_fov_cols = self.half_fov_rays * 2 + 1  # Left + center + right
-        cell_width = vp_width / total_fov_cols
-        cell_height = vp_height / self.v_layers
-
-        # Draw rays layer by layer
-        for layer in range(self.v_layers):
-            layer_start = layer * self.h_rays
-            # Flip vertical so top layers are rendered at top of screen
-            screen_row = self.v_layers - 1 - layer
-            y = vp_y + screen_row * cell_height
-
-            col = 0
-
-            # Left side of FOV (rays h_rays-half_fov_rays to h_rays-1)
-            for i in range(self.h_rays - self.half_fov_rays, self.h_rays):
-                ray_idx = layer_start + i
-                distance = rays[ray_idx, 0]  # Raw distance in world units
-                hit_type = rays[ray_idx, 1]  # Normalized hit type
-
-                x = vp_x + col * cell_width
-                color = self._get_depth_color(distance, hit_type)
-                pygame.draw.rect(self.screen, color,
-                               (int(x), int(y), int(cell_width) + 1, int(cell_height) + 1))
-                col += 1
-
-            # Right side of FOV (rays 0 to half_fov_rays)
-            for i in range(self.half_fov_rays + 1):
-                ray_idx = layer_start + i
-                distance = rays[ray_idx, 0]
-                hit_type = rays[ray_idx, 1]
-
-                x = vp_x + col * cell_width
-                color = self._get_depth_color(distance, hit_type)
-                pygame.draw.rect(self.screen, color,
-                               (int(x), int(y), int(cell_width) + 1, int(cell_height) + 1))
-                col += 1
 
         # Draw crosshair at center
         cx = vp_x + vp_width // 2
@@ -219,8 +401,7 @@ class DepthViewer:
         """
         Draw top-down radar view showing all 360° rays.
 
-        This is the classic LiDAR visualization - shows spatial awareness
-        in all directions with depth-based coloring.
+        Uses Numba-accelerated pixel rendering for high ray counts.
 
         Args:
             rays: Ray data from OmniRaycast
@@ -234,86 +415,63 @@ class DepthViewer:
         center_y = self.height // 2
         max_radius = radar_size // 2
 
-        # Draw grid circles for distance reference
+        # Clear pixel buffer to background color
+        self._pixel_buffer[:, :, 0] = COLOR_BG[0]
+        self._pixel_buffer[:, :, 1] = COLOR_BG[1]
+        self._pixel_buffer[:, :, 2] = COLOR_BG[2]
+
+        # Fast Numba rendering of all rays to pixel buffer
+        rays_f64 = rays.astype(np.float64) if rays.dtype != np.float64 else rays
+        _render_radar_fast(
+            self._pixel_buffer, rays_f64,
+            self.h_rays, self.v_layers,
+            center_x, center_y, max_radius,
+            self.max_dist, self.fov_degrees
+        )
+
+        # Blit pixel buffer to screen using surfarray
+        pygame.surfarray.blit_array(self._render_surface, self._pixel_buffer.swapaxes(0, 1))
+        self.screen.blit(self._render_surface, (0, 0))
+
+        # Draw overlays with pygame (these are few items, so fast)
+        # Grid circles for distance reference
         for r in range(50, max_radius, 50):
             pygame.draw.circle(self.screen, COLOR_GRID, (center_x, center_y), r, 1)
 
-        # Draw FOV indicator lines
+        # FOV indicator lines
         half_fov = self.fov_degrees / 2
         for angle in [-half_fov, half_fov]:
-            rad = math.radians(angle - 90)  # -90 because forward is up
+            rad = math.radians(angle - 90)
             end_x = int(center_x + math.cos(rad) * max_radius)
             end_y = int(center_y + math.sin(rad) * max_radius)
             pygame.draw.line(self.screen, COLOR_FOV_LINE,
                            (center_x, center_y), (end_x, end_y), 1)
 
-        # Draw rays for middle vertical layer (eye level)
-        middle_layer = self.v_layers // 2
-        layer_start = middle_layer * self.h_rays
-
-        # Draw all rays as lines from center
-        for i in range(self.h_rays):
-            ray_idx = layer_start + i
-
-            # Angle: 0 = forward (up on screen), increases clockwise
-            angle_deg = (i / self.h_rays) * 360
-            angle_rad = math.radians(angle_deg - 90)  # -90 so 0° is up
-
-            distance = rays[ray_idx, 0]  # Raw distance in world units
-            hit_type = rays[ray_idx, 1]
-
-            # Normalize distance for display
-            norm_dist = min(1.0, distance / self.max_dist)
-
-            # Calculate end point
-            ray_length = norm_dist * max_radius
-            end_x = int(center_x + math.cos(angle_rad) * ray_length)
-            end_y = int(center_y + math.sin(angle_rad) * ray_length)
-
-            # Get color based on hit type and depth
-            color = self._get_depth_color(distance, hit_type)
-
-            # Draw ray - check sky first (1.0) before enemy (0.67)
-            if hit_type > 0.9:  # Sky
-                pygame.draw.line(self.screen, color, (center_x, center_y), (end_x, end_y), 2)
-            elif hit_type > 0.6:  # Enemy
-                pygame.draw.line(self.screen, color, (center_x, center_y), (end_x, end_y), 3)
-                pygame.draw.circle(self.screen, COLOR_ENEMY_GLOW, (end_x, end_y), 5)
-            else:  # Wall or nothing
-                pygame.draw.line(self.screen, color, (center_x, center_y), (end_x, end_y), 1)
-
         # Draw player at center
         pygame.draw.circle(self.screen, COLOR_PLAYER, (center_x, center_y), 6)
-        # Direction indicator (forward arrow)
         pygame.draw.line(self.screen, COLOR_PLAYER,
                         (center_x, center_y), (center_x, center_y - 15), 2)
 
         # Overlay enemies from memory (EnemyDetector) - shows even if rays blocked
         if enemies:
             for enemy in enemies:
-                angle_h = enemy.get('angle_h', 0)  # Horizontal angle relative to view
+                angle_h = enemy.get('angle_h', 0)
                 dist = enemy.get('distance', 0)
                 has_los = enemy.get('has_los', True)
 
-                # Convert to radar coordinates
-                # angle_h: 0 = forward, positive = right
-                # Radar: 0° = up (forward), clockwise
-                angle_rad = math.radians(angle_h - 90)  # -90 so 0° is up
+                angle_rad = math.radians(angle_h - 90)
                 norm_dist = min(1.0, dist / self.max_dist)
                 enemy_radius = norm_dist * max_radius
 
                 enemy_x = int(center_x + math.cos(angle_rad) * enemy_radius)
                 enemy_y = int(center_y + math.sin(angle_rad) * enemy_radius)
 
-                # Draw enemy marker (red dot with glow)
                 if has_los:
-                    # Clear LOS - bright red with line
                     pygame.draw.line(self.screen, COLOR_ENEMY,
                                    (center_x, center_y), (enemy_x, enemy_y), 2)
                     pygame.draw.circle(self.screen, COLOR_ENEMY, (enemy_x, enemy_y), 8)
                     pygame.draw.circle(self.screen, COLOR_ENEMY_GLOW, (enemy_x, enemy_y), 12, 2)
                 else:
-                    # No LOS - dimmer marker (behind wall)
                     dim_color = (150, 50, 50)
                     pygame.draw.circle(self.screen, dim_color, (enemy_x, enemy_y), 6)
 
@@ -332,9 +490,13 @@ class DepthViewer:
         fps_text = self.font.render(f"FPS: {self.fps:.0f}", True, COLOR_TEXT)
         self.screen.blit(fps_text, (10, 35))
 
-        # FOV info
-        fov_text = self.font.render(f"FOV: {self.fov_degrees:.0f}° ({self.fov_rays} rays)", True, COLOR_TEXT)
-        self.screen.blit(fov_text, (100, 35))
+        # Ray info - show total rays and resolution
+        deg_per_ray = 360.0 / self.h_rays
+        ray_text = self.font.render(
+            f"Rays: {self.h_rays}×{self.v_layers}={self.total_rays} ({deg_per_ray:.1f}°/ray)",
+            True, COLOR_TEXT
+        )
+        self.screen.blit(ray_text, (100, 35))
 
         # Player stats (bottom bar)
         bottom_y = self.height - 60
@@ -490,10 +652,11 @@ class LidarVisualizer:
 
     def __init__(
         self,
-        h_rays: int = 72,
-        v_layers: int = 9,
+        # Match numba_raycast.py FOV config
+        h_rays: int = 41,
+        v_layers: int = 17,
         fov_degrees: float = 120.0,
-        max_dist: float = 250.0,
+        max_dist: float = 350.0,
     ):
         self.h_rays = h_rays
         self.v_layers = v_layers
@@ -576,7 +739,11 @@ class LidarVisualizer:
 
 
 def test_standalone():
-    """Test the viewer with live raycast data."""
+    """Test the viewer with live raycast data.
+
+    Uses HIGH ray count for visualization quality (360 rays = 1° per ray).
+    This is SEPARATE from training config which uses fewer rays for efficiency.
+    """
     from ..raycast import OmniRaycastObserver
     from ..memory import ACMemoryReader
 
@@ -591,10 +758,15 @@ def test_standalone():
         print("Failed to attach to AssaultCube!")
         return
 
-    max_dist = 250.0
+    # HIGH ray count for visualization (1° per ray = smooth coverage)
+    # Training uses fewer rays (41) for efficiency - this is just for viewing
+    h_rays = 360       # 1° per ray - full smooth 360° coverage
+    v_layers = 17      # Vertical layers for depth
+    max_dist = 350.0
+
     raycast = OmniRaycastObserver(
-        horizontal_rays=72,
-        vertical_layers=9,
+        horizontal_rays=h_rays,
+        vertical_layers=v_layers,
         max_distance=max_dist
     )
     if not raycast.attach():
@@ -604,14 +776,15 @@ def test_standalone():
 
     # Create viewer (in main process for standalone test)
     viewer = DepthViewer(
-        horizontal_rays=72,
-        vertical_layers=9,
+        horizontal_rays=h_rays,
+        vertical_layers=v_layers,
         fov_degrees=120.0,
         max_distance=max_dist,
     )
     viewer.init_display()
 
-    print("[+] Running... Press ESC to exit")
+    print(f"[+] Running with {h_rays}×{v_layers}={h_rays*v_layers} rays (1°/ray)")
+    print("[+] Press ESC to exit")
 
     try:
         while viewer.running:

@@ -34,9 +34,9 @@ class AimTrainer:
         aim_speed: float = 0.3,
         shoot: bool = False,
         game_fov: float = 120.0,
-        max_distance: float = 250.0,
-        horizontal_rays: int = 144,  # 2.5° resolution - catches small openings
-        vertical_layers: int = 9,
+        max_distance: float = 350.0,   # Match numba_raycast fov_max_dist
+        horizontal_rays: int = 41,     # Match numba_raycast fov_rays_h
+        vertical_layers: int = 17,     # Match numba_raycast fov_rays_v
         visualize: bool = False,
     ):
         """

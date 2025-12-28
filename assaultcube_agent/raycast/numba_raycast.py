@@ -159,16 +159,16 @@ class NumbaRaycastObserver:
 
     def __init__(
         self,
-        # FOV configuration
+        # FOV configuration - matches AC max FOV setting (120°)
         fov_rays_h: int = 41,
         fov_rays_v: int = 17,
-        fov_h: float = 110.0,
+        fov_h: float = 120.0,  # Match in-game FOV
         fov_v: float = 80.0,
-        fov_max_dist: float = 300.0,
+        fov_max_dist: float = 350.0,
 
-        # Omni configuration
-        omni_rays: int = 24,
-        omni_max_dist: float = 100.0,
+        # Omni configuration (360° spatial awareness for navigation)
+        omni_rays: int = 36,  # 10° resolution (was 24 = 15° gaps)
+        omni_max_dist: float = 150.0,
 
         # Tracing config
         step_size: float = 2.0,

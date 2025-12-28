@@ -179,13 +179,14 @@ class OmniRaycastObserver:
     """
     Full 360° omnidirectional raycasting.
 
-    Default configuration:
-        - 72 horizontal rays (every 5°, full 360°)
-        - 9 vertical layers (-60° to +60°, every 15°)
-        - Total: 648 rays
+    Default configuration (matches numba_raycast.py FOV config):
+        - 41 horizontal rays (full 360°)
+        - 17 vertical layers (-40° to +40°, 80° vertical span)
+        - Total: 697 rays (matches fov_rays_h × fov_rays_v)
+        - Max distance: 350 units
 
     The observation is organized as:
-        [v_layer_0 (72 rays), v_layer_1 (72 rays), ..., v_layer_8 (72 rays)]
+        [v_layer_0 (41 rays), v_layer_1 (41 rays), ..., v_layer_16 (41 rays)]
 
     Each ray: [distance (world units), hit_type (0=nothing, 0.33=wall, 0.67=enemy, 1.0=sky)]
     """
@@ -194,11 +195,12 @@ class OmniRaycastObserver:
 
     def __init__(
         self,
-        horizontal_rays: int = 72,      # Every 5° = 360°
-        vertical_layers: int = 9,       # -60° to +60° in 15° steps
-        vertical_min: float = -60.0,
-        vertical_max: float = 60.0,
-        max_distance: float = 250.0,
+        # Match numba_raycast.py FOV config for consistency
+        horizontal_rays: int = 41,      # Match fov_rays_h
+        vertical_layers: int = 17,      # Match fov_rays_v
+        vertical_min: float = -40.0,    # 80° vertical span (match fov_v)
+        vertical_max: float = 40.0,
+        max_distance: float = 350.0,    # Match fov_max_dist
         step_size: float = 0.5,         # Small enough to not skip 1-unit walls
         enemy_hitbox_radius: float = 4.0,
     ):
@@ -303,19 +305,22 @@ class OmniRaycastObserver:
             total_sqrs = self._ssize * self._ssize
             world_bytes = self.pm.read_bytes(self._world_ptr, total_sqrs * SQR_SIZE)
 
+            # FAST: Convert to numpy array and reshape for vectorized extraction
             # sqr struct layout (from world.h):
             # 0: type, 1: floor, 2: ceil, 3: wtex, 4: ftex, 5: ctex, 6-8: rgb, 9: vdelta, ...
+            raw = np.frombuffer(world_bytes, dtype=np.uint8).reshape(total_sqrs, SQR_SIZE)
+
             self._world_data = np.zeros((total_sqrs, 5), dtype=np.float64)
-            for i in range(total_sqrs):
-                base = i * SQR_SIZE
-                self._world_data[i, 0] = world_bytes[base]      # type (uchar)
-                # floor and ceil are signed chars (-128 to 127)
-                floor_val = world_bytes[base + 1]
-                ceil_val = world_bytes[base + 2]
-                self._world_data[i, 1] = floor_val if floor_val < 128 else floor_val - 256
-                self._world_data[i, 2] = ceil_val if ceil_val < 128 else ceil_val - 256
-                self._world_data[i, 3] = world_bytes[base + 5]  # ctex (ceiling texture) - byte 5!
-                self._world_data[i, 4] = world_bytes[base + 9]  # vdelta for heightfields
+            self._world_data[:, 0] = raw[:, 0]  # type (uchar)
+
+            # floor and ceil are signed chars (-128 to 127) - vectorized conversion
+            floor_u8 = raw[:, 1].astype(np.int16)
+            ceil_u8 = raw[:, 2].astype(np.int16)
+            self._world_data[:, 1] = np.where(floor_u8 < 128, floor_u8, floor_u8 - 256)
+            self._world_data[:, 2] = np.where(ceil_u8 < 128, ceil_u8, ceil_u8 - 256)
+
+            self._world_data[:, 3] = raw[:, 5]  # ctex (ceiling texture) - byte 5!
+            self._world_data[:, 4] = raw[:, 9]  # vdelta for heightfields
         except Exception as e:
             print(f"[OmniRaycast] World refresh error: {e}")
             self._world_data = np.zeros((1, 5), dtype=np.float64)
