@@ -104,10 +104,12 @@ class DepthViewer:
         self.frame_count = 0
 
     def init_display(self):
-        """Initialize pygame display."""
+        """Initialize pygame display with hardware acceleration."""
         pygame.init()
         pygame.display.set_caption("Depth View - AssaultCube Agent")
-        self.screen = pygame.display.set_mode((self.width, self.height))
+        # Use hardware surface + double buffering for GPU acceleration
+        flags = pygame.HWSURFACE | pygame.DOUBLEBUF
+        self.screen = pygame.display.set_mode((self.width, self.height), flags)
         self.font = pygame.font.SysFont("consolas", 14)
         self.font_large = pygame.font.SysFont("consolas", 18, bold=True)
         self.clock = pygame.time.Clock()
@@ -213,12 +215,17 @@ class DepthViewer:
         pygame.draw.line(self.screen, COLOR_CROSSHAIR,
                         (cx, cy - crosshair_size), (cx, cy + crosshair_size), 2)
 
-    def draw_radar(self, rays: np.ndarray):
+    def draw_radar(self, rays: np.ndarray, enemies: list = None):
         """
         Draw top-down radar view showing all 360° rays.
 
         This is the classic LiDAR visualization - shows spatial awareness
         in all directions with depth-based coloring.
+
+        Args:
+            rays: Ray data from OmniRaycast
+            enemies: Optional list of enemy info dicts with 'angle_h' and 'distance' keys
+                     (from EnemyDetector, shows enemies even if rays are blocked)
         """
         # Center the radar in the window
         margin = 80
@@ -266,13 +273,13 @@ class DepthViewer:
             # Get color based on hit type and depth
             color = self._get_depth_color(distance, hit_type)
 
-            # Draw ray
-            if hit_type > 0.6:  # Enemy
+            # Draw ray - check sky first (1.0) before enemy (0.67)
+            if hit_type > 0.9:  # Sky
+                pygame.draw.line(self.screen, color, (center_x, center_y), (end_x, end_y), 2)
+            elif hit_type > 0.6:  # Enemy
                 pygame.draw.line(self.screen, color, (center_x, center_y), (end_x, end_y), 3)
                 pygame.draw.circle(self.screen, COLOR_ENEMY_GLOW, (end_x, end_y), 5)
-            elif hit_type > 0.9:  # Sky
-                pygame.draw.line(self.screen, color, (center_x, center_y), (end_x, end_y), 2)
-            else:
+            else:  # Wall or nothing
                 pygame.draw.line(self.screen, color, (center_x, center_y), (end_x, end_y), 1)
 
         # Draw player at center
@@ -281,11 +288,45 @@ class DepthViewer:
         pygame.draw.line(self.screen, COLOR_PLAYER,
                         (center_x, center_y), (center_x, center_y - 15), 2)
 
+        # Overlay enemies from memory (EnemyDetector) - shows even if rays blocked
+        if enemies:
+            for enemy in enemies:
+                angle_h = enemy.get('angle_h', 0)  # Horizontal angle relative to view
+                dist = enemy.get('distance', 0)
+                has_los = enemy.get('has_los', True)
+
+                # Convert to radar coordinates
+                # angle_h: 0 = forward, positive = right
+                # Radar: 0° = up (forward), clockwise
+                angle_rad = math.radians(angle_h - 90)  # -90 so 0° is up
+                norm_dist = min(1.0, dist / self.max_dist)
+                enemy_radius = norm_dist * max_radius
+
+                enemy_x = int(center_x + math.cos(angle_rad) * enemy_radius)
+                enemy_y = int(center_y + math.sin(angle_rad) * enemy_radius)
+
+                # Draw enemy marker (red dot with glow)
+                if has_los:
+                    # Clear LOS - bright red with line
+                    pygame.draw.line(self.screen, COLOR_ENEMY,
+                                   (center_x, center_y), (enemy_x, enemy_y), 2)
+                    pygame.draw.circle(self.screen, COLOR_ENEMY, (enemy_x, enemy_y), 8)
+                    pygame.draw.circle(self.screen, COLOR_ENEMY_GLOW, (enemy_x, enemy_y), 12, 2)
+                else:
+                    # No LOS - dimmer marker (behind wall)
+                    dim_color = (150, 50, 50)
+                    pygame.draw.circle(self.screen, dim_color, (enemy_x, enemy_y), 6)
+
     def draw_stats(self, player_state: Optional[dict] = None):
         """Draw stats overlay."""
-        # Title bar
-        title = self.font_large.render("DEPTH VIEWPORT", True, COLOR_TEXT)
+        # Title bar - show current view mode
+        view_name = "RADAR VIEW" if self.view_mode == VIEW_RADAR else "FOV VIEWPORT"
+        title = self.font_large.render(view_name, True, COLOR_TEXT)
         self.screen.blit(title, (10, 10))
+
+        # Toggle hint
+        hint = self.font.render("[V] Toggle view", True, (120, 120, 120))
+        self.screen.blit(hint, (self.width - 110, 10))
 
         # FPS
         fps_text = self.font.render(f"FPS: {self.fps:.0f}", True, COLOR_TEXT)
@@ -326,13 +367,15 @@ class DepthViewer:
             self.screen.blit(text, (x + 16, legend_y - 1))
             x += 80
 
-    def update(self, rays: np.ndarray, player_state: Optional[dict] = None):
+    def update(self, rays: np.ndarray, player_state: Optional[dict] = None, enemies: list = None):
         """
         Update the visualization with new ray data.
 
         Args:
             rays: Shape (total_rays, 2) - [raw_distance, hit_type]
-            player_state: Optional dict with health, frags, damage, etc.
+            player_state: Optional dict with health, frags, damage, enemies, etc.
+            enemies: Optional list of enemy dicts with 'angle_h', 'distance', 'has_los'
+                     (from EnemyDetector - shows on radar even if rays blocked)
         """
         if not self.running:
             return False
@@ -346,12 +389,22 @@ class DepthViewer:
                 if event.key == pygame.K_ESCAPE:
                     self.running = False
                     return False
+                elif event.key == pygame.K_v:
+                    # Toggle view mode
+                    self.view_mode = VIEW_FOV if self.view_mode == VIEW_RADAR else VIEW_RADAR
+
+        # Extract enemies from player_state if not passed separately
+        if enemies is None and player_state:
+            enemies = player_state.get('enemies', None)
 
         # Clear screen
         self.screen.fill(COLOR_BG)
 
-        # Draw FOV viewport (full screen, no radar)
-        self.draw_fov_viewport(rays)
+        # Draw based on view mode
+        if self.view_mode == VIEW_RADAR:
+            self.draw_radar(rays, enemies)
+        else:
+            self.draw_fov_viewport(rays)
         self.draw_stats(player_state)
 
         # Update display

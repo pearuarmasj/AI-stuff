@@ -96,6 +96,19 @@ SQR_CHF = 3      # ceiling heightfield
 SQR_SPACE = 4
 SQR_SEMISOLID = 5
 
+# sqr struct field offsets (within 16-byte sqr)
+SQR_TYPE = 0     # uchar type
+SQR_FLOOR = 1    # schar floor height
+SQR_CEIL = 2     # schar ceiling height
+SQR_VDELTA = 3   # uchar vertex delta
+SQR_CTEX = 4     # uchar ceiling texture
+SQR_FTEX = 5     # uchar floor texture
+SQR_WTEX = 6     # uchar wall texture
+SQR_UTEX = 7     # uchar upper wall texture
+
+# Sky texture ID (texture 0 is skybox in Cube engine)
+DEFAULT_SKY_TEXTURE = 0
+
 
 # =============================================================================
 # KNOWN PLAYER PTR OFFSETS FOR DIFFERENT VERSIONS

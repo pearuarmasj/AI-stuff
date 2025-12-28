@@ -182,6 +182,7 @@ class LOSChecker:
             if sqr_type == SOLID:
                 return max(dist - 0.1, 0.0)
 
+            # floor/ceil are already in world-compatible units for this implementation
             if vz < floor or vz > ceil:
                 return max(dist - 0.1, 0.0)
 

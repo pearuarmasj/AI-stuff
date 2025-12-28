@@ -35,7 +35,7 @@ class AimTrainer:
         shoot: bool = False,
         game_fov: float = 120.0,
         max_distance: float = 250.0,
-        horizontal_rays: int = 72,
+        horizontal_rays: int = 144,  # 2.5° resolution - catches small openings
         vertical_layers: int = 9,
         visualize: bool = False,
     ):
@@ -157,10 +157,16 @@ class AimTrainer:
         # Update LiDAR visualization if enabled
         if self._visualizer and self._visualizer.is_running() and self._raycast:
             rays = self._raycast.get_observation()
+            # Convert enemies to dict format for radar overlay
+            enemy_data = [
+                {'angle_h': e.angle_h, 'distance': e.distance, 'has_los': e.has_los}
+                for e in enemies
+            ]
             self._visualizer.update(rays, {
                 'health': state.health,
                 'frags': state.frags,
                 'damage': state.damage_dealt,
+                'enemies': enemy_data,  # Pass enemies for radar overlay
             })
 
         if do_debug:
