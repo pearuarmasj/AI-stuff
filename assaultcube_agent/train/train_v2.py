@@ -34,7 +34,7 @@ from stable_baselines3.common.callbacks import (
     BaseCallback,
 )
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 from ..env import OmniAssaultCubeEnv
 from ..env.action_wrapper import wrap_env_for_sb3
@@ -62,11 +62,11 @@ class TrainingConfigV2:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
-    ent_coef: float = 0.01
+    ent_coef: float = 0.05  # Higher for more exploration (was 0.01 - got stuck)
 
-    # Network
+    # Network - bigger for high-dimensional observations
     policy: str = "MultiInputPolicy"
-    net_arch: list = field(default_factory=lambda: [256, 256])
+    net_arch: list = field(default_factory=lambda: [512, 512, 256])
 
     # Logging
     log_dir: str = "logs/assaultcube_v2"
@@ -96,11 +96,29 @@ class EmergencyStopCallback(BaseCallback):
 
         return True
 
+    def _on_rollout_end(self) -> None:
+        """Release all keys between rollouts (during PPO gradient updates).
+
+        This prevents keys from staying pressed while PPO does its update step.
+        Also clears CUDA cache to prevent GPU memory buildup.
+        """
+        self._release_all_keys()
+
+        # Periodic CUDA cleanup to prevent GPU memory corruption
+        try:
+            torch.cuda.empty_cache()
+        except:
+            pass
+
     def _release_all_keys(self):
         """Release all keys in the environment."""
         try:
-            if hasattr(self.env, 'envs'):
-                for e in self.env.envs:
+            # Handle VecNormalize wrapper
+            env = self.env
+            if hasattr(env, 'venv'):
+                env = env.venv
+            if hasattr(env, 'envs'):
+                for e in env.envs:
                     unwrapped = e
                     while hasattr(unwrapped, 'env'):
                         unwrapped = unwrapped.env
@@ -124,6 +142,21 @@ class NeuralNetworkVisualizerCallback(BaseCallback):
         super().__init__(verbose)
         self.log_freq = log_freq
         self._printed_architecture = False
+
+    def _short_name(self, name: str) -> str:
+        """Shorten parameter names to avoid TensorBoard truncation collisions."""
+        # mlp_extractor.policy_net.0.weight -> pn0_w
+        # mlp_extractor.value_net.2.bias -> vn2_b
+        # action_net.weight -> act_w
+        # value_net.weight -> val_w
+        # log_std -> log_std
+        name = name.replace("mlp_extractor.", "")
+        name = name.replace("policy_net", "pn")
+        name = name.replace("value_net", "vn")
+        name = name.replace("action_net", "act")
+        name = name.replace(".weight", "_w")
+        name = name.replace(".bias", "_b")
+        return name
 
     def _on_training_start(self) -> None:
         """Print network architecture at start of training."""
@@ -159,19 +192,19 @@ class NeuralNetworkVisualizerCallback(BaseCallback):
         for name, param in policy.named_parameters():
             if param.requires_grad:
                 data = param.data.cpu().numpy()
+                short = self._short_name(name)
 
-                # Log scalar statistics
-                self.logger.record(f"nn/{name}/mean", float(np.mean(data)))
-                self.logger.record(f"nn/{name}/std", float(np.std(data)))
-                self.logger.record(f"nn/{name}/min", float(np.min(data)))
-                self.logger.record(f"nn/{name}/max", float(np.max(data)))
-                self.logger.record(f"nn/{name}/abs_mean", float(np.mean(np.abs(data))))
+                # Log scalar statistics with shortened names
+                self.logger.record(f"nn/{short}_mean", float(np.mean(data)))
+                self.logger.record(f"nn/{short}_std", float(np.std(data)))
+                self.logger.record(f"nn/{short}_min", float(np.min(data)))
+                self.logger.record(f"nn/{short}_max", float(np.max(data)))
 
                 # Log gradient statistics if available
                 if param.grad is not None:
                     grad = param.grad.cpu().numpy()
-                    self.logger.record(f"nn_grad/{name}/mean", float(np.mean(grad)))
-                    self.logger.record(f"nn_grad/{name}/std", float(np.std(grad)))
+                    self.logger.record(f"grad/{short}_mean", float(np.mean(grad)))
+                    self.logger.record(f"grad/{short}_std", float(np.std(grad)))
 
         return True
 
@@ -187,25 +220,41 @@ class NeuralNetworkVisualizerCallback(BaseCallback):
                 print(f"    {name}: mean={np.mean(data):.4f}, std={np.std(data):.4f}")
 
 
-def make_env(config: TrainingConfigV2, render_mode: Optional[str] = None):
+def make_env(config: TrainingConfigV2, render_mode: Optional[str] = None, normalize: bool = True):
     """Create wrapped environment."""
-    env = OmniAssaultCubeEnv(
-        horizontal_rays=config.horizontal_rays,
-        vertical_layers=config.vertical_layers,
-        vertical_min=config.vertical_min,
-        vertical_max=config.vertical_max,
-        max_ray_distance=config.max_ray_distance,
-        max_episode_steps=config.max_episode_steps,
-        render_mode=render_mode,
-    )
 
-    # Wrap for SB3 (flatten action space)
-    env = wrap_env_for_sb3(env)
+    def _make_env():
+        """Inner function to create single env (avoids closure issues)."""
+        env = OmniAssaultCubeEnv(
+            horizontal_rays=config.horizontal_rays,
+            vertical_layers=config.vertical_layers,
+            vertical_min=config.vertical_min,
+            vertical_max=config.vertical_max,
+            max_ray_distance=config.max_ray_distance,
+            max_episode_steps=config.max_episode_steps,
+            render_mode=render_mode,
+        )
+        # Wrap for SB3 (flatten action space)
+        env = wrap_env_for_sb3(env)
+        # Monitor wrapper
+        env = Monitor(env)
+        return env
 
-    # Monitor wrapper
-    env = Monitor(env)
+    # Vectorize
+    vec_env = DummyVecEnv([_make_env])
 
-    return env
+    # Normalize observations and rewards - CRITICAL for stable learning
+    if normalize:
+        vec_env = VecNormalize(
+            vec_env,
+            norm_obs=True,
+            norm_reward=True,
+            clip_obs=10.0,
+            clip_reward=10.0,
+            gamma=config.gamma,
+        )
+
+    return vec_env
 
 
 def train(config: TrainingConfigV2, resume_from: Optional[str] = None):
@@ -298,22 +347,57 @@ def train(config: TrainingConfigV2, resume_from: Optional[str] = None):
         )
     except KeyboardInterrupt:
         print("\n[!] Training interrupted by user")
+    except Exception as e:
+        print(f"\n[!] Training error: {e}")
     finally:
+        # CRITICAL: Clean up EVERYTHING to prevent GPU state corruption
+        print("\n[*] Cleaning up...")
         on_stop()
         emergency_stop.stop_listener()
 
+        # Close environment FIRST
+        try:
+            env.close()
+        except:
+            pass
+
+        # Clear CUDA cache to release GPU memory
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        except:
+            pass
+
+        # Force garbage collection
+        import gc
+        gc.collect()
+
     # Save final model
     final_path = log_dir / "final_model.zip"
-    model.save(str(final_path))
+    try:
+        model.save(str(final_path))
 
-    print("\n" + "=" * 70)
-    print("  TRAINING COMPLETE")
-    print("=" * 70)
-    print(f"  Model saved: {final_path}")
-    print(f"  Logs: {log_dir}")
-    print("=" * 70)
+        # Save VecNormalize statistics (IMPORTANT - needed for evaluation)
+        if isinstance(env, VecNormalize):
+            vec_norm_path = log_dir / "vec_normalize.pkl"
+            env.save(str(vec_norm_path))
+            print(f"  VecNormalize saved: {vec_norm_path}")
 
-    env.close()
+        print("\n" + "=" * 70)
+        print("  TRAINING COMPLETE")
+        print("=" * 70)
+        print(f"  Model saved: {final_path}")
+        print(f"  Logs: {log_dir}")
+        print("=" * 70)
+    except Exception as e:
+        print(f"[!] Failed to save model: {e}")
+
+    # Final CUDA cleanup
+    try:
+        torch.cuda.empty_cache()
+    except:
+        pass
+
     return model
 
 
@@ -326,7 +410,19 @@ def evaluate(model_path: str, n_episodes: int = 5, config: Optional[TrainingConf
     model = PPO.load(model_path)
 
     print("[*] Creating environment with rendering...")
-    env = make_env(config, render_mode="human")
+    env = make_env(config, render_mode="human", normalize=True)
+
+    # Try to load VecNormalize stats from training
+    model_dir = Path(model_path).parent
+    vec_norm_path = model_dir / "vec_normalize.pkl"
+    if vec_norm_path.exists():
+        print(f"[*] Loading VecNormalize stats: {vec_norm_path}")
+        env = VecNormalize.load(str(vec_norm_path), env.venv)
+
+    # Set to eval mode (don't update stats)
+    if isinstance(env, VecNormalize):
+        env.training = False
+        env.norm_reward = False
 
     print(f"\n[*] Evaluating for {n_episodes} episodes...")
 
@@ -335,15 +431,17 @@ def evaluate(model_path: str, n_episodes: int = 5, config: Optional[TrainingConf
     episode_deaths = []
 
     for ep in range(n_episodes):
-        obs, info = env.reset()
+        obs = env.reset()  # VecEnv returns just obs
         done = False
         ep_reward = 0
+        info = {}
 
         while not done:
             action, _ = model.predict(obs, deterministic=True)
-            obs, reward, terminated, truncated, info = env.step(action)
-            done = terminated or truncated
-            ep_reward += reward
+            obs, reward, dones, infos = env.step(action)  # VecEnv API
+            done = dones[0]
+            ep_reward += reward[0]
+            info = infos[0]
 
         episode_rewards.append(ep_reward)
         episode_kills.append(info.get('kills', 0))

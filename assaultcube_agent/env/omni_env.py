@@ -215,30 +215,29 @@ class OmniAssaultCubeEnv(gym.Env):
 
         reward = 0.0
 
-        # SKY STARING - immediate punishment (but reduced)
+        # SKY STARING - strong immediate punishment
         if sky_ratio > 0.5:
-            # Scale by how bad it is (0.5 = -0.5, 1.0 = -1.0)
-            reward = -0.5 * (sky_ratio / 0.5)
+            # Scale by how bad it is (0.5 = -2.0, 1.0 = -4.0)
+            reward = -2.0 * (sky_ratio / 0.5)
             self._stare_counter = 0
             self._last_dominant_view = 'sky'
             return reward
 
-        # WALL/FLOOR STARING - only punish after LONG staring (30+ frames)
-        # Walls are everywhere during navigation - don't punish normal play
+        # WALL/FLOOR STARING - punish after 10 frames (was 30 - too lenient)
         dominant = None
-        if wall_ratio > 0.8:  # Increased threshold
+        if wall_ratio > 0.7:
             dominant = 'wall'
-        elif nothing_ratio > 0.8:  # Increased threshold
+        elif nothing_ratio > 0.7:
             dominant = 'floor'
 
         if dominant:
             if dominant == self._last_dominant_view:
                 self._stare_counter += 1
-                # Only start punishing after 30 frames of staring
-                if self._stare_counter > 30:
-                    # Gentle escalation: -0.1 base, +0.02 per frame over 30
-                    escalation = min((self._stare_counter - 30) * 0.02, 0.4)
-                    reward = -0.1 - escalation
+                # Start punishing after 10 frames of staring
+                if self._stare_counter > 10:
+                    # Stronger escalation: -0.5 base, +0.1 per frame over 10, cap at -3.0
+                    escalation = min((self._stare_counter - 10) * 0.1, 2.5)
+                    reward = -0.5 - escalation
             else:
                 self._stare_counter = 1
             self._last_dominant_view = dominant
@@ -253,9 +252,10 @@ class OmniAssaultCubeEnv(gym.Env):
         """
         Angle-based aiming reward using EnemyDetector.
 
-        - Dead center on enemy: +2.0
-        - Inside hitbox (gradient): +0.0 to +0.5
-        - Outside hitbox: -0.2 flat + -0.01/degree (cap -1.0)
+        BOOSTED to actually guide the agent toward enemies.
+        - Dead center on enemy: +5.0
+        - Inside hitbox (gradient): +1.0 to +3.0
+        - Close (within 30°): +0.5 gradient
         - No enemies visible: 0.0
         """
         if self.enemy_detector is None or self._last_game_state is None:
@@ -287,25 +287,24 @@ class OmniAssaultCubeEnv(gym.Env):
         hitbox_angle = math.degrees(math.atan2(5.0, max(closest.distance, 1.0)))
 
         if angle_off <= hitbox_angle:
-            # INSIDE HITBOX - gradient reward
+            # INSIDE HITBOX - strong gradient reward
             precision = 1.0 - (angle_off / hitbox_angle)  # 1.0 = dead center
 
             if precision > 0.95:
-                return 2.0  # Dead center - big reward
+                return 5.0  # Dead center - BIG reward (was 2.0)
             else:
-                return 0.5 * precision  # Gradient: 0.0 to 0.5
+                return 1.0 + 2.0 * precision  # Gradient: +1.0 to +3.0 (was 0.0 to 0.5)
         else:
-            # OUTSIDE HITBOX - REWARD for getting closer, small penalty for far off
-            # This encourages turning toward enemies instead of punishing exploration
+            # OUTSIDE HITBOX - reward for getting closer
             if angle_off < 30.0:
-                # Within 30 degrees - reward for being close
-                return 0.1 * (1.0 - angle_off / 30.0)  # +0.1 at 0°, +0.0 at 30°
+                # Within 30 degrees - good reward for being close
+                return 0.5 * (1.0 - angle_off / 30.0)  # +0.5 at 0°, +0.0 at 30° (was 0.1)
             elif angle_off < 90.0:
-                # 30-90 degrees - neutral, agent is trying
-                return 0.0
+                # 30-90 degrees - small reward for at least facing right direction
+                return 0.1 * (1.0 - (angle_off - 30.0) / 60.0)  # +0.1 to 0.0
             else:
-                # >90 degrees - very small penalty (enemy behind you)
-                return -0.05
+                # >90 degrees - enemy behind you, small penalty
+                return -0.1
 
     def _is_aiming_at_enemy(self) -> bool:
         """Check if center rays are hitting an enemy."""
@@ -355,9 +354,8 @@ class OmniAssaultCubeEnv(gym.Env):
         current_ammo = gs.ammo_mag
         ammo_diff = self._last_ammo - current_ammo
 
-        if ammo_diff < 0:
-            # Ammo increased = pickup (or reload, but reward anyway)
-            reward += 0.5 * abs(ammo_diff)
+        # NOTE: Removed reload exploit - was rewarding reloads as "pickups"
+        # Only reward actual ammo pickups (would need to track reserve ammo to detect)
 
         shots_fired = max(0, ammo_diff)
 
@@ -434,7 +432,7 @@ class OmniAssaultCubeEnv(gym.Env):
         if is_dead and not self._is_dead:
             self._deaths += 1
             self._is_dead = True
-            return -50.0  # Death penalty
+            return -25.0  # Death penalty (reduced from -50 to not make hiding optimal)
         elif not is_dead and self._is_dead:
             # Just respawned
             self._is_dead = False
@@ -460,8 +458,8 @@ class OmniAssaultCubeEnv(gym.Env):
 
         # === EXISTING REWARDS (rebalanced) ===
 
-        # Survival (reduced - dense rewards provide more signal)
-        reward += 0.005
+        # Survival - minimal, just to break ties (was 0.005 - too much free reward)
+        reward += 0.001
 
         # Damage taken
         if gs.health < self._last_health:
@@ -469,29 +467,30 @@ class OmniAssaultCubeEnv(gym.Env):
             reward -= damage_taken * 0.4
         self._last_health = gs.health
 
-        # Damage dealt (reduced - weapon reward covers some of this)
+        # Damage dealt - MUCH stronger to encourage combat
         if gs.damage_dealt > self._last_damage_dealt:
             damage_this_step = gs.damage_dealt - self._last_damage_dealt
-            reward += damage_this_step * 0.5  # Reduced from 1.0
+            reward += damage_this_step * 2.0  # Was 0.5 - way too weak
             self._total_damage += damage_this_step
         self._last_damage_dealt = gs.damage_dealt
 
-        # Kill bonus (reduced - aim+weapon rewards help)
+        # Kill bonus - MASSIVE to make kills worth pursuing
         if gs.frags > self._last_frags:
             new_kills = gs.frags - self._last_frags
-            reward += 30.0 * new_kills  # Reduced from 50.0
+            reward += 100.0 * new_kills  # Was 30.0 - not worth the risk of dying
             self._kills += new_kills
         self._last_frags = gs.frags
 
-        # Movement bonus (encourages not camping)
+        # Movement bonus (encourages not camping) - increased
         velocity = math.sqrt(gs.vel_x**2 + gs.vel_y**2)
         if velocity > 10.0:
-            reward += 0.002
+            reward += 0.01  # Was 0.002 - too weak
 
-        # Anti-stuck
+        # Anti-stuck - MUCH stronger penalty for camping/hiding
         stuck = self._get_stuck_ratio()
-        if stuck > 0.7:
-            reward -= 0.05 * stuck
+        if stuck > 0.5:
+            # Escalating penalty: -0.5 at 0.5 ratio, up to -2.0 at 1.0 ratio
+            reward -= 0.5 + (stuck - 0.5) * 3.0
 
         return reward
 
